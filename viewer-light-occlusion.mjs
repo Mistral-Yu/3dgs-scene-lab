@@ -60,15 +60,16 @@ const createCanceledResult = ({
   transmission: null,
 });
 
-const validateLights = (lights) => {
+export const validateLights = (lights) => {
   if (!Array.isArray(lights) || lights.length === 0) {
-    throw new Error("Light occlusion needs at least one point light");
+    throw new Error("Light occlusion needs at least one light sample");
   }
   if (lights.length > LIGHT_OCCLUSION_MAX_LIGHTS) {
-    throw new Error(`Light occlusion supports at most ${LIGHT_OCCLUSION_MAX_LIGHTS} point lights; no partial sampling is performed`);
+    throw new Error(`Light occlusion supports at most ${LIGHT_OCCLUSION_MAX_LIGHTS} light samples; no partial sampling is performed`);
   }
   const ids = [];
   const positions = [];
+  const directions = [];
   const seenIds = new Set();
   lights.forEach((light, index) => {
     const id = light?.id;
@@ -85,8 +86,13 @@ const validateLights = (lights) => {
     seenIds.add(id);
     ids.push(id);
     positions.push([position[0], position[1], position[2]]);
+    const d = light?.direction;
+    if (light?.type === 'directional' && (!d || d.length !== 3 || !d.every(Number.isFinite) || !(Math.hypot(...d) > 0))) {
+      throw new Error(`Light occlusion light ${id} needs a finite nonzero direction`);
+    }
+    directions.push(light?.type === 'directional' ? d.map(v => v / Math.hypot(...d)) : null);
   });
-  return { lightIds: Object.freeze(ids), positions };
+  return { lightIds: Object.freeze(ids), positions, directions };
 };
 
 /**
@@ -138,7 +144,7 @@ export async function computeAllSplatLightTransmissionAsync({
   // Keep the exact static-bake transform rejection and owned-world snapshot
   // contract.  Validation is intentionally complete before BVH indexing.
   const total = validateStaticBakeSnapshot(snapshot, { requireRgb: false });
-  const { lightIds, positions } = validateLights(lights);
+  const { lightIds, positions, directions } = validateLights(lights);
   const lightCount = lightIds.length;
   const scalarSlots = total * lightCount;
   if (!Number.isSafeInteger(scalarSlots) || scalarSlots > LIGHT_OCCLUSION_MAX_SCALAR_SLOTS) {
@@ -212,6 +218,7 @@ export async function computeAllSplatLightTransmissionAsync({
         const visibility = evaluateBvhTransmission({
           bvh,
           lightPosition: positions[lightIndex],
+          lightDirection: directions[lightIndex],
           receiverIndex: flatIndex,
           snapshot,
         });

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import * as tone from '../viewer-tone-curve.mjs';
 import { SPLAT_COLOR_SPACE } from '../viewer-color.mjs';
+import { expandLightSamples } from '../viewer-light-types.mjs';
 import { applyDirectLighting, applyOneBouncePreview, DIRECT_LIGHT_NORMAL_POLICY, orientDirectLightNormal } from '../viewer-lighting.mjs';
 
 const source = readFileSync(new URL('../viewer.js', import.meta.url), 'utf8');
@@ -12,6 +13,21 @@ const method = (name, bindings = {}) => {
   const next = /\n      (?:async )?\w+\(/.exec(source.slice(start));
   return new Function(...Object.keys(bindings), `return ({${source.slice(start, next ? start + next.index : undefined)}}).${name};`)(...Object.values(bindings));
 };
+
+test('legacy bounce toggles refresh alternate appearance and reject non-point lights', () => {
+  const toggle=method('setOneBouncePreview',{ONE_BOUNCE_VPL_LIMIT:6});
+  const calls=[];
+  const viewer={sceneLights:[{type:'point',visible:true}],state:{oneBouncePreview:false},activeOneBounceVplCount:6,
+    syncOneBouncePreviewUi(){},syncLightingRuntimeState(){},renderPickedColors(){},invalidateRender(){},queueSparkSceneUpdate(){},updateStatus(){},
+    refreshActiveBackendSnapshot(reason,options){calls.push({enabled:this.state.oneBouncePreview,reason,options});}};
+  toggle.call(viewer,true); toggle.call(viewer,false);
+  assert.deepEqual(calls.map(c=>c.enabled),[true,false]);
+  assert.ok(calls.every(c=>c.options.appearanceOnly));
+  viewer.sceneLights=[{type:'area',visible:true}];
+  toggle.call(viewer,true);
+  assert.equal(viewer.state.oneBouncePreview,false);
+  assert.equal(calls.length,2);
+});
 const expressionStart = source.indexOf('    const evaluateToneCurveExpression = ');
 const expressionEnd = source.indexOf('\n    const createToneCurveColorModifier', expressionStart);
 const expressionBindings = {
@@ -121,6 +137,7 @@ test('picked-color readouts use the second light cache as well as the first afte
   grade.curves.master = curves[0];
   const sample = { splatIndex: 5, baseLinearRgb: Object.freeze([0.12, 0.2, 0.32]) };
   const viewer = {
+    getLightSamples() { return expandLightSamples(this.sceneLights); },
     state: { oneBouncePreview: false }, camera: { getWorldPosition: () => [0, 4, 4] },
     getRenderModeForItem: () => 'beauty', getBeautyExposureScaleForItem: () => 2,
     getSampleWorldPosition: () => [0, 0, 0], getSampleWorldNormal: () => [0, 1, 0],
@@ -145,6 +162,7 @@ test('releasing an occlusion cache refreshes picked colors and the hover value i
     const viewer = {
       sceneItems: [item], state: { lightOcclusionEnabled: false }, lightOcclusionRevision: 0,
       lightOcclusionController: { cancel() {} }, hoverPointer,
+      refreshActiveBackendSnapshot(reason, options) { assert.equal(options.appearanceOnly, true); },
       releaseLightOcclusion: (entry) => { entry.lightOcclusion.enabled.value = false; },
       getLightOcclusionAvailability: () => ({ enabled: true }), syncLightOcclusionUi() {},
       renderPickedColors: () => { assert.equal(item.lightOcclusion.enabled.value, false); events.push('picked'); },

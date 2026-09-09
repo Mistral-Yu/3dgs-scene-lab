@@ -5,7 +5,7 @@
     "build": "npm run build:main && npm run build:vendor:playcanvas && npm run build:vendor:three-r186",
     "build:main": "esbuild viewer.js --bundle --minify --alias:three/addons/postprocessing/Pass.js=./vendor/three/examples/jsm/postprocessing/Pass.js --alias:three=./vendor/three/three.module.js --external:node:worker_threads --format=iife --platform=browser --target=es2020 --outfile=viewer.bundle.js",
     "build:vendor:playcanvas": "esbuild viewer-vendor-playcanvas.mjs --bundle --minify --external:node:worker_threads --format=iife --platform=browser --target=es2020 --outfile=viewer-vendor-playcanvas.bundle.js",
-    "build:vendor:three-r186": "esbuild viewer-vendor-three-r186.mjs --bundle --minify --format=iife --platform=browser --target=es2020 --outfile=viewer-vendor-three-r186.bundle.js",
+    "build:vendor:three-r186": "node tools/build-three-r186.mjs",
     "test": "node --test tests/*.test.mjs",
     "check": "npm run test && npm run build && node --check viewer.js && htmlhint index.html",
     "dev": "http-server . -p 4173 -c-1 --cors",
@@ -21,6 +21,6 @@
   },
   "dependencies": {
     "playcanvas": "2.22.0",
-    "three-r186": "https://codeload.github.com/mrdoob/three.js/tar.gz/283a3b359d70bf6dc7b54bc129698fbb32be49a9"
+    "three-r186": "npm:three@0.186.0"
   }
 }

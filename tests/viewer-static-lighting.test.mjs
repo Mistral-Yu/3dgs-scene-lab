@@ -898,7 +898,7 @@ test("static bake UI labels all-splat production and keeps legacy proxy modes op
   assert.match(source, /coherent source clusters .*experimental approximation/);
   assert.match(source, /generic splats remained occluders only/);
   assert.match(source, /markStaticBakeStale\("Light, opacity, transform, or visibility changed"\)/);
-  assert.ok(/refreshLightingModel\(\{ forceModifierRebuild = false, occlusionChanged = true \} = \{\}\)[\s\S]*?syncLightingRuntimeState\(\);\s*this\.syncStaticBakeUi\(\);/.test(source), "lighting changes synchronize runtime state and bake eligibility");
+  assert.ok(/refreshLightingModel\(\{ forceModifierRebuild = false, occlusionChanged = true, geometryChanged = true \} = \{\}\)[\s\S]*?syncLightingRuntimeState\(\);\s*this\.syncStaticBakeUi\(\);/.test(source), "lighting changes synchronize runtime state and bake eligibility");
   assert.match(source, /applyTransformFromGizmo\(\)[\s\S]*?markStaticBakeStale\("Splat transform changed"\)/);
   assert.match(source, /resetTransform\(\)[\s\S]*?markStaticBakeStale\("Splat transform reset"\)/);
   assert.match(source, /Clear the active animation modifier before baking; animation is not captured/);

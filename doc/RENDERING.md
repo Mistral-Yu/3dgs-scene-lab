@@ -7,8 +7,8 @@
 | Backend | Gaussian path | SH / color | Lighting and shadow boundary |
 | --- | --- | --- | --- |
 | Spark 2.1 (default) | Existing native Spark renderer | Source-dependent SH0–SH3 | Look-dev controls and selected-item animation remain active. Optional cached all-splat point-light occlusion supports static scenes; the shared static-baked SH0 below is also displayed. |
-| PlayCanvas 2.22.0 | Public `GSplatData` + `GSplatResource` unified GSplat renderer | SH0 appearance snapshot | Exposure, point lights, available occlusion, one-bounce preview, LUT results, and tone curves are evaluated in shared Linear sRGB CPU code. Animation remains Spark only. |
-| Three.js r186dev | Instanced camera-facing anisotropic Gaussian ellipse quads with projected covariance and deterministic depth sorting | SH0 appearance snapshot | Exposure, point lights, available occlusion, one-bounce preview, LUT results, and tone curves are evaluated in shared Linear sRGB CPU code. Animation remains Spark only. |
+| PlayCanvas 2.22.0 | Public unified GSplat renderer; WebGPU preferred, WebGL2 compatibility | SH0, GPU-resident appearance | Exposure, point lights, cached occlusion and PCHIP tone curves run in Linear sRGB on GPU. Animation remains Spark only. |
+| Three.js r186 | Official GaussianSplat + WebGPURenderer; GPU counting sort (official CPU sort on WebGL2 fallback) | SH0, GPU-resident appearance | Linear exposure, direct lights, visibility and curves run in a GPU pre-pass. Animation remains Spark only. |
 
 Alternate backends consume only the copied snapshot. They never render through
 Spark, and a failed backend activation leaves the currently active backend in
@@ -17,19 +17,37 @@ replacement is ready; the visible-only snapshot is captured after lazy vendor
 loading so scene edits made during loading are not lost. PlayCanvas and Three.js are separate
 classic-script bundles loaded only on first selection, so Spark startup does
 not evaluate either vendor. The Three backend asserts
-`THREE.REVISION === "186dev"`; selecting it still reports the expected
+`THREE.REVISION === "186"`; selecting it still reports the expected
 multiple-Three warning because Spark r180 and the comparison renderer coexist.
 All three generated bundles are minified at build time; this changes delivery
 and parse cost only, not renderer parameters or lighting math.
 
-For imported splats whose normals are inferred from covariance, alternate
-appearance snapshots refresh once camera navigation settles so face-forward
-lighting does not remain captured from an old side of the surface.
+For imported splats whose normals are inferred from covariance, GPU appearance
+updates with the camera. CPU-compatibility snapshots refresh after navigation
+settles so face-forward lighting does not remain captured from an old side.
 
 Three receives exact world-space Gaussian covariance, including non-uniform
 scale, shear, and reflection. Covariance is packed once per snapshot or edited
-item, then reused for camera-depth sorting and GPU projection. The separate
+item, then reused for GPU counting sort and official projection. The separate
 static-bake transform restrictions below still apply.
+
+The old custom Three GLSL projection and per-frame CPU attribute sort are removed.
+Visible items are flattened into one world-space `GaussianSplat` for global
+ordering. The official addon is pinned to npm `three@0.186.0`; its renderer,
+opacity compensation, projection and sorting are used directly. A single
+build-time guard avoids upstream `atan2(0,0)` for circular projections, which
+otherwise disappeared on the tested GPU. `tools/build-three-r186.mjs` fails closed
+if the upstream source no longer matches; no files in node_modules are patched.
+
+`viewer-three-native.mjs` isolates revision-checked private storage access because
+r186 has no public dynamic splat color/geometry hook. The GPU appearance pre-pass
+writes the addon's native packed RGBA8 stream, while normals, curves and visibility
+remain float32. WebGL2 uses full CPU appearance snapshots, never silent truncation.
+The Three bundle follows the official example's isolated sRGB working/output
+space for encoded splat compositing. Appearance is explicitly computed in Linear
+sRGB and encoded once. Export remains independent, sRGB by default. RGBA8 native
+color precision and the fixed 2-sigma support mean pixel-exact Spark parity is not
+promised; SH1–SH3 are not yet forwarded by this viewer's snapshot contract.
 
 ## Renderer controls and transforms
 
@@ -57,19 +75,16 @@ the panel does not claim to expose every engine API.
   the Splats tab.
 - [PlayCanvas 2.22.0](https://api.playcanvas.com/engine/classes/GSplatParams.html):
   Work-buffer precision (compact/large), Gaussian antialiasing, radial sorting, pixel-size cutoff, forward alpha cutoff,
-  and 2DGS. The viewer uses WebGL with CPU sorting and flat snapshots, so controls
-  specific to WebGPU or streamed LoD are omitted.
-- [Three.js WebGLRenderer](https://threejs.org/docs/pages/WebGLRenderer.html):
-  tone mapping, tone-mapping exposure, object sorting, plus material depth testing
-  and wireframe, plus the viewer shader's Gaussian support, alpha cutoff and
-  projected blur variance. Shader defaults preserve the existing 3-sigma,
-  zero-cutoff, zero-blur projection. Gaussian projection is a custom viewer shader; Three.js does
-  not define official defaults for that shader. The pinned r186dev comparison
-  build and Spark's compatible Three.js r180 host remain in place.
+  and 2DGS. Flat snapshots do not use streamed LoD; additional WebGPU-specific
+  controls are not yet exposed in this panel.
+- [Three.js GaussianSplat](https://threejs.org/docs/pages/GaussianSplat.html):
+  object sorting, material depth testing and wireframe. The official addon fixes
+  Gaussian support at 2 sigma and antialiasing kernel variance at 0.3, so obsolete
+  custom cutoff/alpha/blur controls are removed. Spark's r180 host stays isolated.
 
 These are display settings, separate from the shared look-dev appearance baked
-into exported PLY files. Three.js tone mapping is disabled by default; enabling
-it applies an additional display transform after the shared appearance snapshot.
+into exported PLY files. Additional Three.js output tone mapping is omitted to
+preserve encoded splat compositing; shared exposure and tone curves remain active.
 
 **Splats → Move / Rotate / Scale** enables the selected gizmo directly. A
 transparent helper pass displays it above all three backends without routing
@@ -98,28 +113,103 @@ point picking still require Spark.
   Save explains the required reset instead of silently exporting another look.
   SH/falloff checkboxes record metadata only; they do not export SH1–SH3.
 
-## Point-light occlusion
+## Light types and occlusion
 
-In Spark, add a point light and enable **Light → Occlusion**. Every visible
+**Light → type → Add** creates Point, Directional, or rectangular Area lights.
+All three renderers share the same Linear-sRGB shading and sRGB color export.
+Point retains inverse-square falloff. Directional has no distance falloff;
+its position moves only the helper. RX/RY/RZ are XYZ Euler degrees, with local
+`-Z` as the direction of emission. Area additionally exposes width/height in
+native scene units, not assumed meters. Its outline shows the actual rectangle.
+
+Area is a one-sided diffuse-emitter approximation using four deterministic
+midpoint samples. Each sample has its own receiver-facing factor, emitter-facing
+factor, inverse-square attenuation and all-splat visibility; contributions are
+summed, not averaged visibility multiplied by center lighting. Intensity is
+total normalized source strength divided among samples, independent of size,
+not calibrated luminance. Four samples can show discrete shadow lobes; this is
+not an exact area integral or path-traced soft shadow.
+
+Directional rays are parallel and span twice the scene BVH diagonal from each
+receiver toward the source, not rays to an arbitrary distant point. They retain
+same-item sigma bias but no segment-relative endpoint floor: an unrelated far
+splat must not enlarge receiver bias. Geometry and direction key the cache;
+moving the directional helper reuses visibility.
+
+Static Bake and legacy shadow/bounce previews remain **point-light only** and
+are disabled for visible Area/Directional lights. Normal color export supports
+these new lights; it does not serialize editable light objects.
+The models follow the [PBRT distant-light](https://www.pbr-book.org/4ed/Light_Sources/Distant_Lights)
+and [area-light](https://pbr-book.org/4ed/Light_Sources/Area_Lights) conventions,
+with the explicit low-sample and nonphysical captured-radiance limits above.
+
+In any renderer, add a light and enable **Light → Occlusion**. Every visible
 splat is included as both a receiver and a possible blocker; this is not the
-legacy 32-proxy preview. A Worker builds one BVH and caches a scalar transmission
-value for each splat/light pair. Spark reads these values by stable source index
+legacy 32-proxy preview. WebGPU compute traverses a cached BVH and caches a scalar
+transmission value for each splat/light pair. Renderers read these values by stable source index
 and attenuates only the added direct light, leaving the original RGB/SH intact.
 
 - Moving a light or splat, editing geometry/opacity, or changing visibility
   invalidates the cache immediately and schedules a refresh after input settles.
-  Camera motion and light intensity/color changes reuse the cache.
+  Light-only edits retain geometry buffers and reuse unchanged lights. Geometry
+  edits rebuild the BVH. Camera motion and light intensity/color changes reuse
+  the applied cache without dispatching visibility work.
 - **Update Shadows** retries explicitly. **Cancel Shadows** stops pending or
   running work. Until a fresh cache is ready, added light is unoccluded and the
   status explains whether work is queued, running, canceled, or unavailable.
-- The opt-in path supports up to 8 visible lights and 8,000,000 splat/light
+- The opt-in path supports up to 8 shadow samples and 8,000,000 splat/sample
   pairs, subject to the GPU texture-size limit. Exceeding a limit rejects the
   whole update rather than sampling a subset or silently dropping blockers.
+  Point and Directional consume one sample; Area consumes four (e.g. two Areas,
+  or one Area plus four Point/Directional lights). No blockers are subsampled.
 - Active animation/modifiers, paged or covariance-only splat storage, static
-  Bake, and alternate renderers are not supported by this cache. Clear the
-  animation/Bake or return to Spark to refresh it. As with static Bake, visible
+  Bake are not supported by this cache. Clear the
+  animation/Bake to refresh it. As with static Bake, visible
   transforms must be rigid or uniformly scaled; shear/reflection are rejected.
-- `file://` uses the same cooperative main-thread fallback as static Bake.
+- WebGPU is preferred wherever the browser exposes a usable device, including
+  eligible local-file contexts. HTTPS or localhost is recommended. Missing GPU
+  support or storage/range limits use an explicit **CPU fallback** with a reason;
+  shader/validation failures are reported, not hidden behind fallback.
+- The device, pipeline and immutable geometry buffers persist between updates.
+  Bounded dispatches allow cancellation; stale or partial results are never
+  published. All resources are released on page exit or geometry invalidation
+  as appropriate. Device loss can be recovered by **Update Shadows**.
+- BVH preparation still runs cooperatively on CPU. Numerically ambiguous hard
+  endpoint/support cutoffs are marked on GPU and checked with the float64 CPU
+  reference; the UI reports the number of CPU boundary checks. This avoids
+  changing the optical model at discontinuous boundaries.
+- Transmission is unitless (`NoColorSpace`). It is read back once per bounded
+  batch and uploaded to the active renderer's texture. The compute device is
+  not shared with PlayCanvas's or Three.js's display device. Spark still uses WebGL.
+  The status duration includes setup,
+  trace, transfer and atlas preparation, not final-frame GPU completion.
+
+Run the small browser regression at `tests/webgpu-occlusion.html` via the local
+server. It checks actual WGSL against the CPU reference, including a hard-cutoff
+rounding regression, multiple lights/batches, cancellation and device recovery.
+Implementation order and current evidence are in [TODO](TODO.md).
+
+### GPU appearance and static Bake
+
+Alternate backends retain original Linear sRGB and world-normal textures between
+geometry edits. Ordinary exposure/light/tone edits upload only a 4 KiB parameter
+row per item; they do not recapture or relight every splat on CPU. Visibility
+textures update only when the cache or light mapping changes. PlayCanvas uses
+the public work-buffer modifier and parameter invalidation APIs. Topology edits
+recreate its backend asynchronously while keeping the old canvas until ready;
+this avoids stale unified-sort buffers in the host-driven rendering loop.
+
+Up to eight direct-light samples and 32 points per tone-curve channel use this GPU path.
+Legacy sampled shadows and authored one-bounce preview use the complete CPU
+compatibility appearance path, as do larger curve/light configurations; none are
+silently truncated. Picking and export retain the CPU reference. Export remains
+sRGB, never raw Linear-sRGB bytes. No new color-space conversion is introduced.
+
+Static **All-splat direct** Bake uses GPU visibility and optical depth, then the
+existing CPU linear-RGB assembly and reversible write transaction. Authored
+one-bounce Bake remains the separate Worker path. Bake diagnostics distinguish
+these execution paths. GPU appearance adds 64 bytes per receiver plus parameters;
+device texture-size limits are checked rather than dropping receivers.
 
 This is cached visibility, not a full-scene ray trace every frame or physical
 global illumination. The optical-depth kernel approximates each Gaussian using
@@ -180,9 +270,9 @@ its SHA-256 output remained
 
 ## Additional constraints
 
-- Point lights affect splats only in Beauty mode; diagnostic modes remain unlit.
-- The Three.js comparison backend is pinned to upstream commit
-  `283a3b359d70bf6dc7b54bc129698fbb32be49a9` with runtime revision `186dev`.
+- Lights affect splats only in Beauty mode; diagnostic modes remain unlit.
+- The Three.js backend is pinned to official npm `three@0.186.0`, runtime `186`.
+  Re-review the guarded native adapter and circular-projection fix on upgrades.
 - Authored bounce grouping assumes the supported Cube axis normals and Macbeth
   `+Z` normal. Oblique authored materials require a tighter normal-coherence key
   before they can be added safely.

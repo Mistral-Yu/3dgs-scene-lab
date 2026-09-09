@@ -80,7 +80,7 @@ test('light metadata updates preserve the buttons being clicked while a numeric 
   for (const [name, next] of [
     ['applySelectedLightIntensity', 'applySelectedLightHelperScale'],
     ['applySelectedLightColor', 'applySelectedLightPosition'],
-    ['applySelectedLightPosition', 'collectLightOccluderSamples'],
+    ['applySelectedLightPosition', 'applySelectedLightShape'],
   ]) {
     assert.doesNotMatch(viewerMethod(name, next).toString(), /this\.syncLightList\(\)/);
   }

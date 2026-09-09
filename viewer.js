@@ -1,4 +1,6 @@
 import * as THREE from "./vendor/three/three.module.js";
+import { appearanceSupported } from "./viewer-gpu-appearance.mjs";
+import { expandLightSamples, lightTypeCode, lightVector } from './viewer-light-types.mjs';
 import { createRendererSettings, renderRendererSettings } from "./viewer-renderer-settings.mjs";
 import { OrbitControls } from "./vendor/three/examples/jsm/controls/OrbitControls.js";
 import { TransformControls } from "./vendor/three/examples/jsm/controls/TransformControls.js";
@@ -55,13 +57,15 @@ import {
 } from "./viewer-color.mjs";
 import { createSceneSnapshot, flattenVisibleSnapshot } from "./renderer-contract.mjs";
 import { LookDevBackendManager } from "./viewer-backends.mjs";
+import { WebGpuLightOcclusionController } from "./viewer-webgpu-occlusion.mjs";
+import { WebGpuStaticLightingBakeController } from "./viewer-webgpu-static-lighting.mjs";
 import {
   getLightOcclusionTextureLayout,
   LIGHT_OCCLUSION_MAX_LIGHTS,
   LIGHT_OCCLUSION_MAX_SCALAR_SLOTS,
 } from "./viewer-light-occlusion.mjs";
 import {
-  StaticLightingBakeController,
+  createLightOcclusionWorkerSnapshot,
   createStaticBakeRestoreHandle,
 } from "./viewer-static-lighting-client.mjs";
 import {
@@ -263,6 +267,14 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
       lightZInput: document.getElementById("light-z-input"),
       lensChip: document.getElementById("lens-chip"),
       addPointLightButton: document.getElementById("add-point-light-button"),
+      lightTypeSelect: document.getElementById("light-type-select"),
+      lightRotationFields: document.getElementById("light-rotation-fields"),
+      lightAreaFields: document.getElementById("light-area-fields"),
+      lightRxInput: document.getElementById("light-rx-input"),
+      lightRyInput: document.getElementById("light-ry-input"),
+      lightRzInput: document.getElementById("light-rz-input"),
+      lightWidthInput: document.getElementById("light-width-input"),
+      lightHeightInput: document.getElementById("light-height-input"),
       addPrimitiveButton: document.getElementById("add-primitive-button"),
       animationApplyButton: document.getElementById("animation-apply-button"),
       animationCopyDefaultButton: document.getElementById("animation-copy-default-button"),
@@ -652,6 +664,8 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
       lightOccluderCount,
       lightOcclusionHandles,
       lightPositions,
+      lightTypes,
+      lightDirections,
       lightCount,
       occluderOpacities,
       occluderPositions,
@@ -694,8 +708,10 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         for (let lightIndex = 0; lightIndex < lightCount; lightIndex += 1) {
           const lightPosition = lightPositions[lightIndex];
           const lightIntensity = max(lightIntensities[lightIndex], floatZero);
-          const toLight = sub(lightPosition, center);
-          const lightDistanceSq = max(dot(toLight, toLight), floatEps);
+          const isDirectional = greaterThan(lightTypes[lightIndex], dynoConst('float', 0.5));
+          const isArea = greaterThan(lightTypes[lightIndex], dynoConst('float', 1.5));
+          const toLight = select(isArea, sub(lightPosition, center), select(isDirectional, mul(lightDirections[lightIndex], floatNegativeOne), sub(lightPosition, center)));
+          const lightDistanceSq = select(isArea, max(dot(toLight, toLight), floatEps), select(isDirectional, floatOne, max(dot(toLight, toLight), floatEps)));
           const lightDirection = div(toLight, max(length(toLight), floatEps));
           const lightFacing = max(dot(normal, lightDirection), floatZero);
           let visibility = floatOne;
@@ -744,7 +760,8 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
           if (lightOcclusionHandles) {
             visibility = mul(visibility, readLightOcclusion(outputs.index, lightOcclusionHandles, lightIndex, lightCount));
           }
-          const lightStrength = mul(mul(div(lightIntensity, lightDistanceSq), lightFacing), visibility);
+          const emission = select(isArea, max(dot(lightDirections[lightIndex], mul(lightDirection, floatNegativeOne)), floatZero), floatOne);
+          const lightStrength = mul(mul(mul(div(lightIntensity, lightDistanceSq), lightFacing), visibility), emission);
           lightBoostR = add(lightBoostR, mul(lightColorR[lightIndex], lightStrength));
           lightBoostG = add(lightBoostG, mul(lightColorG[lightIndex], lightStrength));
           lightBoostB = add(lightBoostB, mul(lightColorB[lightIndex], lightStrength));
@@ -1532,8 +1549,13 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         this.lightOccluderSamples = [];
         this.runtimeLightOccluders = [];
         this.runtimeOneBounceVpls = [];
-        this.staticBakeController = new StaticLightingBakeController();
-        this.lightOcclusionController = new StaticLightingBakeController();
+        this.staticBakeController = new WebGpuStaticLightingBakeController();
+        this.lightOcclusionController = new WebGpuLightOcclusionController();
+        this.lightOcclusionSnapshot = null;
+        window.addEventListener("pagehide", () => {
+          void this.lightOcclusionController.dispose();
+          void this.staticBakeController.dispose();
+        });
         this.lightOcclusionEmptyTexture = createLightOcclusionTexture();
         this.lightOcclusionRevision = 0;
         this.lightOcclusionTimer = 0;
@@ -1557,6 +1579,8 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
           colorG: [],
           colorR: [],
           intensities: [],
+          types: [],
+          directions: [],
           occluderOpacities: [],
           occluderPositions: [],
           occluderRadii: [],
@@ -2248,6 +2272,10 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
           this.dom.lightZInput,
         ], (commit) => this.applySelectedLightPosition(commit));
         this.bindCommitInputs([
+          this.dom.lightRxInput, this.dom.lightRyInput, this.dom.lightRzInput,
+          this.dom.lightWidthInput, this.dom.lightHeightInput,
+        ], (commit) => this.applySelectedLightShape(commit));
+        this.bindCommitInputs([
           this.dom.rotationXInput,
           this.dom.rotationYInput,
           this.dom.rotationZInput,
@@ -2373,16 +2401,33 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         this.dom.shSelect.disabled = id !== "spark" || !this.getSelectedItem();
       }
 
-      captureRendererSnapshot() {
+      getGpuAppearanceStates() {
+        return this.sceneItems.filter(item => item.visible && item.mesh?.visible !== false && item.mesh).map(item => {
+          const beauty = this.getRenderModeForItem(item) === "beauty";
+          return { id: item.id, exposure: beauty ? this.getBeautyExposureScaleForItem(item) : 1,
+            faceForward: !item.hasAuthoredSplatNormals,
+            lights: beauty && !this.staticBakeApplied ? this.getLightSamples() : [],
+            legacy: beauty && !this.staticBakeApplied && this.state.legacySampledShadow,
+            bounce: beauty && !this.staticBakeApplied && this.state.oneBouncePreview,
+            toneCurve: item.settings?.toneCurve ?? buildToneCurveState(),
+            visibility: item.lightOcclusion?.enabled.value ? item.lightOcclusion : null,
+          };
+        });
+      }
+
+      captureRendererSnapshot({ gpuAppearance = Boolean(this.backendManager?.activeBackend?.supportsGpuAppearance) } = {}) {
         this.syncVisibleSceneItemTransforms();
+        const states = this.getGpuAppearanceStates();
+        const useGpu = gpuAppearance && states.every(appearanceSupported);
+        const normals = new Map();
         // Camera position is shared by every splat in this CPU snapshot. Cache
         // it once to avoid two world-matrix reads and allocations per sample.
         const appearanceContext = {
           cameraPosition: this.camera.getWorldPosition(new THREE.Vector3()),
         };
-        return createSceneSnapshot(this.sceneItems, {
-          mapLinearRgb: ({ index, linearRgb, sceneItem, splatCenter, splatQuaternion, splatScale }) => (
-            this.getDisplayLinearColorForSample(sceneItem, {
+        const snapshot = createSceneSnapshot(this.sceneItems, {
+          mapLinearRgb: ({ index, linearRgb, sceneItem, splatCenter, splatQuaternion, splatScale }) => {
+            const sample = {
               baseLinearRgb: linearRgb,
               localNormal: this.getSplatLocalNormal({
                 quaternion: splatQuaternion,
@@ -2394,18 +2439,33 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
                 Number(splatCenter?.z ?? splatCenter?.[2] ?? 0) || 0,
               ),
               splatIndex: index,
-            }, appearanceContext)
-          ),
+            };
+            if (!useGpu) return this.getDisplayLinearColorForSample(sceneItem, sample, appearanceContext);
+            let values = normals.get(sceneItem.id);
+            if (!values) { values = new Float32Array(this.getPackedSplatCount(sceneItem) * 3); normals.set(sceneItem.id, values); }
+            const normal = this.getSampleWorldNormal(sceneItem, sample);
+            if (normal) values.set([normal.x, normal.y, normal.z], index * 3);
+            return linearRgb;
+          },
           visibleOnly: true,
         });
+        snapshot.items.forEach(item => {
+          item.appearance = useGpu ? states.find(state => state.id === item.id) : null;
+          item.appearanceNormals = useGpu ? normals.get(item.id) : null;
+        });
+        return snapshot;
       }
 
-      refreshActiveBackendSnapshot(reason = "scene updated", { force = false, syncActive = true } = {}) {
+      refreshActiveBackendSnapshot(reason = "scene updated", { force = false, syncActive = true, appearanceOnly = false } = {}) {
         if (!this.backendManager) {
           return;
         }
         if (!force && this.backendManager.isSparkActive()) return;
         try {
+          if (appearanceOnly && syncActive && this.backendManager.activeBackend?.setAppearance?.(this.getGpuAppearanceStates())) {
+            this.forceVisualRefresh(2);
+            return;
+          }
           this.backendManager.setSnapshot(this.captureRendererSnapshot(), { syncActive });
           this.pendingActiveBackendTransformSync = false;
           // PlayCanvas reconciles unified GSplat placement changes during its
@@ -2423,7 +2483,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         if (!this.backendManager || this.backendManager.isSparkActive()) return;
         if (immediate) {
           this.pendingActiveBackendAppearanceRefreshReason = null;
-          this.refreshActiveBackendSnapshot(reason);
+          this.refreshActiveBackendSnapshot(reason, { appearanceOnly: true });
           return;
         }
         this.pendingActiveBackendAppearanceRefreshReason = reason;
@@ -2433,7 +2493,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         const reason = this.pendingActiveBackendAppearanceRefreshReason;
         if (!reason) return;
         this.pendingActiveBackendAppearanceRefreshReason = null;
-        this.refreshActiveBackendSnapshot(reason);
+        this.refreshActiveBackendSnapshot(reason, { appearanceOnly: true });
       }
 
       hasCameraDependentAlternateAppearance() {
@@ -2451,6 +2511,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
       }
 
       scheduleCameraDependentAppearanceRefresh() {
+        if (this.backendManager?.activeBackend?.gpuAppearanceActive) return;
         if (!this.hasCameraDependentAlternateAppearance()) {
           if (this.cameraAppearanceRefreshHandle) {
             window.clearTimeout(this.cameraAppearanceRefreshHandle);
@@ -2496,7 +2557,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         if (this.dom.backendSelect) this.dom.backendSelect.disabled = true;
         try {
           const activated = await this.backendManager.setActive(id, {
-            getSnapshot: () => this.captureRendererSnapshot(),
+            getSnapshot: (options) => this.captureRendererSnapshot(options),
           });
           if (request !== this.backendSwitchToken || !activated) return;
           this.pendingActiveBackendAppearanceRefreshReason = null;
@@ -2696,6 +2757,12 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
       flushRenderNow() {
         this.syncVisibleSceneItemTransforms();
         this.lightHandles.cameraPosition.value.copy(this.camera.position);
+        // New lights start at the camera. Do not let a near-clipped helper cone
+        // cover the viewport; visibility here affects helpers, never emission.
+        for (const light of this.sceneLights ?? []) {
+          const helperRadius = 0.8 * (light.helperScale ?? DEFAULT_LIGHT_HELPER_SCALE);
+          light.root.visible = light.visible && this.camera.position.distanceTo(light.position) > helperRadius + this.camera.near;
+        }
         if (this.brushOverlayGroup?.visible && this.lastBrushHit) {
           this.updateBrushOverlay(this.lastBrushHit, { invalidate: false });
         }
@@ -2717,7 +2784,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
       }
 
       renderTransformOverlay(clearCanvas) {
-        // The input canvas also carries only the gizmo over alternate engines.
+        // The input canvas carries editing helpers over alternate engines.
         // Scene splats continue to be drawn exclusively by the chosen backend.
         const alpha = this.renderer.getClearAlpha();
         const autoClear = this.renderer.autoClear;
@@ -2729,6 +2796,10 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
           }
           this.renderer.autoClear = false;
           this.renderer.clearDepth();
+          if (clearCanvas && this.lightSceneRoot?.children.some(child => child.visible)) {
+            this.renderer.render(this.lightSceneRoot, this.camera);
+            this.renderer.clearDepth();
+          }
           if (this.transformControlsHelper.visible) {
             this.transformControls.object?.updateWorldMatrix(true, false);
             this.renderer.render(this.gizmoScene, this.camera);
@@ -2796,7 +2867,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         };
       }
 
-      createLightRecord() {
+      createLightRecord(type = 'point') {
         const root = new THREE.Group();
         const defaultLight = createDefaultLightState({
           radius: this.sceneBoundsSphere?.radius ?? 1,
@@ -2817,13 +2888,27 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         );
         halo.rotation.x = -Math.PI / 2;
         root.add(halo, bulb);
+        if (type !== 'point') {
+          const arrow = new THREE.ArrowHelper(new THREE.Vector3(0, 0, -1), new THREE.Vector3(), 0.7, LIGHT_HELPER_COLOR, 0.15, 0.08);
+          root.add(arrow);
+          if (type === 'area') {
+            const outline = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints([
+              new THREE.Vector3(-0.5,-0.5,0), new THREE.Vector3(0.5,-0.5,0),
+              new THREE.Vector3(0.5,0.5,0), new THREE.Vector3(-0.5,0.5,0),
+            ]), new THREE.LineBasicMaterial({ color: LIGHT_HELPER_COLOR }));
+            outline.name = 'area-outline';
+            root.add(outline);
+          }
+        }
         this.lightSceneRoot.add(root);
         return {
           id: `scene-light-${++this.sceneLightSerial}`,
           color: { ...defaultLight.color },
           helperScale: defaultLight.helperScale,
-          intensity: defaultLight.intensity,
-          name: defaultLight.name,
+          intensity: type === 'directional' ? 1 : defaultLight.intensity,
+          name: type === 'point' ? defaultLight.name : `${type === 'area' ? 'Area' : 'Directional'} Light ${this.sceneLightSerial}`,
+          type, rotation: new THREE.Euler(), width: 1, height: 1,
+          direction: new THREE.Vector3(0,0,-1), right: new THREE.Vector3(1,0,0), up: new THREE.Vector3(0,1,0),
           root,
           visible: true,
           position: new THREE.Vector3(),
@@ -2968,6 +3053,15 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
 
       syncSelectedLightControls(syncInputs = true) {
         const light = this.getSelectedLight();
+        this.dom.lightRotationFields.hidden = !light || light.type === 'point';
+        this.dom.lightAreaFields.hidden = light?.type !== 'area';
+        if (syncInputs) {
+          ['x','y','z'].forEach(axis => {
+            this.dom[`lightR${axis}Input`].value = formatNumber(THREE.MathUtils.radToDeg(light?.rotation?.[axis] ?? 0), 1);
+          });
+          this.dom.lightWidthInput.value = formatNumber(light?.width ?? 1, 3);
+          this.dom.lightHeightInput.value = formatNumber(light?.height ?? 1, 3);
+        }
         const lightColor = clampLightColor(light?.color ?? DEFAULT_LIGHT_COLOR);
         this.state.lightHelperScale = light?.helperScale ?? DEFAULT_LIGHT_HELPER_SCALE;
         this.state.lightIntensity = light?.intensity ?? 20;
@@ -3048,15 +3142,14 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
 
       getLightOcclusionAvailability() {
         const items = this.sceneItems.filter((item) => item.visible && item.mesh?.visible !== false && item.mesh);
-        const lights = this.sceneLights.filter((light) => light.visible);
+        const lights = this.getLightSamples();
         const splatCount = items.reduce((sum, item) => sum + this.getPackedSplatCount(item), 0);
         const unavailable = (reason) => ({ enabled: false, reason, items, lights, splatCount });
-        if (!(this.backendManager?.isSparkActive() ?? true)) return unavailable("Switch to Spark for live occlusion");
         if (this.staticBakeApplied || this.staticBakeApplying) return unavailable("Clear / Restore the static bake to use live occlusion");
         if (this.state.animationApplied || this.activeAnimationModifier) return unavailable("Clear the animation before computing occlusion");
         if (!splatCount) return unavailable("Add visible splats");
-        if (!lights.length) return unavailable("Add a visible point light");
-        if (lights.length > LIGHT_OCCLUSION_MAX_LIGHTS) return unavailable(`At most ${LIGHT_OCCLUSION_MAX_LIGHTS} visible lights; no partial shadows`);
+        if (!lights.length) return unavailable("Add a visible light");
+        if (lights.length > LIGHT_OCCLUSION_MAX_LIGHTS) return unavailable(`At most ${LIGHT_OCCLUSION_MAX_LIGHTS} shadow samples (Point/Directional: 1, Area: 4); no partial shadows`);
         if (splatCount * lights.length > LIGHT_OCCLUSION_MAX_SCALAR_SLOTS) return unavailable("Occlusion exceeds the 8M splat × light budget; no partial shadows");
         if (items.some((item) => !item.mesh.forEachSplat || item.mesh.covSplats || item.mesh.paged
           || item.mesh.skinning || item.mesh.rgbaDisplaceEdits || item.baseObjectModifier || item.baseWorldModifier)) {
@@ -3139,9 +3232,13 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         handles.lightIds = [];
       }
 
-      invalidateLightOcclusion(reason, { schedule = true, delay = 450 } = {}) {
+      invalidateLightOcclusion(reason, { schedule = true, delay = 450, geometryChanged = true } = {}) {
         this.lightOcclusionRevision += 1;
         this.lightOcclusionController.cancel();
+        if (geometryChanged) {
+          this.lightOcclusionSnapshot = null;
+          this.lightOcclusionController.invalidateGeometry?.();
+        }
         this.lightOcclusionRunning = false;
         window.clearTimeout(this.lightOcclusionTimer);
         this.lightOcclusionTimer = 0;
@@ -3156,6 +3253,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         }
         this.syncLightOcclusionUi();
         if (hadCache) {
+          this.refreshActiveBackendSnapshot("Shadows invalidated", { appearanceOnly: true });
           this.renderPickedColors();
           if (this.hoverPointer) this.updateHoverReadout();
           this.forceVisualRefresh(2);
@@ -3180,11 +3278,15 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         this.lightOcclusionStatusText = "Preparing occlusion…";
         this.syncLightOcclusionUi();
         try {
-          const snapshot = this.createStaticBakeSnapshot();
+          let snapshot = this.lightOcclusionSnapshot;
+          if (!snapshot) {
+            const fullSnapshot = this.createStaticBakeSnapshot();
+            snapshot = { ...createLightOcclusionWorkerSnapshot(fullSnapshot), itemIds: fullSnapshot.itemIds };
+            this.lightOcclusionSnapshot = snapshot;
+          }
           if (snapshot.count !== availability.splatCount) throw new Error("Incomplete splat snapshot; no partial shadows applied");
           const lights = availability.lights.map((light) => {
-            light.root.updateWorldMatrix(true, false);
-            return { id: light.id, position: light.root.getWorldPosition(new THREE.Vector3()).toArray() };
+            return { id: light.id, type: light.type, direction: lightVector(light.direction), position: lightVector(light.position) };
           });
           const result = await this.lightOcclusionController.startOcclusion({
             snapshot, lights,
@@ -3200,7 +3302,12 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
             return;
           }
           this.applyLightOcclusionResult(snapshot, result, lights.map((light) => light.id));
-          this.lightOcclusionStatusText = `Cached · ${snapshot.count.toLocaleString()} splats × ${lights.length} light${lights.length === 1 ? "" : "s"} · ${(performance.now() - startedAt).toFixed(0)} ms`;
+          this.refreshActiveBackendSnapshot("Shadows updated", { appearanceOnly: true });
+          const execution = result.diagnostics?.execution ?? "CPU";
+          const reused = result.diagnostics?.reusedLights ?? 0;
+          const precision = result.diagnostics?.precisionFallbackReceivers ?? 0;
+          const fallback = result.diagnostics?.fallbackReason;
+          this.lightOcclusionStatusText = `Cached · ${execution} · ${snapshot.count.toLocaleString()} splats × ${lights.length} shadow sample${lights.length === 1 ? "" : "s"} · ${(performance.now() - startedAt).toFixed(0)} ms${reused ? ` · ${reused} reused` : ""}${precision ? ` · ${precision} CPU boundary checks` : ""}${fallback ? ` · ${fallback}` : ""}`;
           this.renderPickedColors();
           if (this.hoverPointer) this.updateHoverReadout();
           this.forceVisualRefresh(3);
@@ -3219,7 +3326,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
 
       applyLightOcclusionResult(snapshot, result, lightIds) {
         const lightCount = lightIds.length;
-        const currentLightIds = this.sceneLights.filter((light) => light.visible).map((light) => light.id);
+        const currentLightIds = this.getLightSamples().map((light) => light.id);
         if (result.lightCount !== lightCount || result.total !== snapshot.count
           || result.transmission?.length !== snapshot.count * lightCount
           || JSON.stringify(result.lightIds) !== JSON.stringify(lightIds)
@@ -3227,10 +3334,11 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
           throw new Error("Occlusion light/splat mapping changed; result discarded");
         }
         const staged = new Map();
+        const itemsById = new Map(this.sceneItems.map((item) => [item.id, item]));
         try {
           for (let index = 0; index < snapshot.count; index += 1) {
             const id = snapshot.itemIds[snapshot.itemIndex[index]];
-            const item = this.getSceneItemById(id);
+            const item = itemsById.get(id);
             if (!item?.visible || !item.mesh) throw new Error("Occlusion item mapping changed");
             if (!staged.has(id)) {
               const count = this.getPackedSplatCount(item);
@@ -3281,6 +3389,12 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
       }
 
       setOneBouncePreview(enabled) {
+        if (enabled && this.sceneLights.some(light => light.visible && light.type !== 'point')) {
+          this.state.oneBouncePreview = false;
+          this.syncOneBouncePreviewUi();
+          this.updateStatus('Legacy bounce preview supports Point lights only');
+          return;
+        }
         this.state.oneBouncePreview = Boolean(enabled);
         this.syncOneBouncePreviewUi();
         // The VPL Dyno handles are fixed and padded, so this only updates
@@ -3292,6 +3406,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         this.renderPickedColors();
         this.invalidateRender();
         this.queueSparkSceneUpdate();
+        this.refreshActiveBackendSnapshot('Bounce preview updated', { appearanceOnly: true });
         this.updateStatus(this.state.oneBouncePreview
           ? `Legacy 6-VPL bounce preview enabled (${this.activeOneBounceVplCount}/${ONE_BOUNCE_VPL_LIMIT} authored VPLs; approximate and may leak through occluders)`
           : "Legacy 6-VPL bounce preview disabled");
@@ -3332,6 +3447,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         if (!splatCount) return { enabled: false, reason: "No visible splats to bake", splatCount };
         if (!visibleLights.length) return { enabled: false, reason: "Add one visible point light to bake", splatCount };
         if (visibleLights.length !== 1) return { enabled: false, reason: "v1 supports exactly one visible point light", splatCount };
+        if (visibleLights[0].type !== 'point') return { enabled: false, reason: 'Static Bake supports Point only; Area / Directional use live lighting and color export', splatCount };
         if (this.state.animationApplied || this.activeAnimationModifier) {
           return { enabled: false, reason: "Clear the active animation modifier before baking; animation is not captured", splatCount };
         }
@@ -3378,8 +3494,9 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
           this.dom.staticBakeMode.disabled = this.staticBakeApplying || this.staticBakeApplied;
         }
         const bounceMode = this.state.staticBakeMode === STATIC_BAKE_MODE.AUTHORED_ONE_BOUNCE;
-        if (this.dom.legacySampledShadowCheckbox) this.dom.legacySampledShadowCheckbox.disabled = bounceMode;
-        if (this.dom.oneBouncePreviewCheckbox) this.dom.oneBouncePreviewCheckbox.disabled = bounceMode;
+        const nonPoint = this.sceneLights.some(light => light.visible && light.type !== 'point');
+        if (this.dom.legacySampledShadowCheckbox) this.dom.legacySampledShadowCheckbox.disabled = bounceMode || nonPoint;
+        if (this.dom.oneBouncePreviewCheckbox) this.dom.oneBouncePreviewCheckbox.disabled = bounceMode || nonPoint;
         if (this.dom.staticBakeStatus && !this.staticBakeApplying) {
           this.dom.staticBakeStatus.textContent = this.staticBakeStaleReason
             ? (this.staticBakeApplied
@@ -3562,7 +3679,8 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
           const changed = transaction.result;
           this.staticBakeApplied = true;
           const elapsed = performance.now() - this.staticBakeStartedAt;
-          const execution = result.execution === "worker" ? "Worker" : "main-thread fallback";
+          const execution = result.execution === "webgpu" ? "WebGPU visibility"
+            : `${result.execution === "worker" ? "Worker" : "main-thread fallback"}${result.fallbackReason ? ` (${result.fallbackReason})` : ""}`;
           const stats = result.diagnostics;
           const modeLabel = this.state.staticBakeMode === STATIC_BAKE_MODE.AUTHORED_ONE_BOUNCE
             ? `Direct + authored one bounce · sources: ${stats.selectedSourceCount} coherent source clusters (${stats.sourceClusterGroupCount} groups; experimental approximation), receivers ${stats.authoredBounceReceiverCount}, paths ${stats.testedPaths}/${stats.plannedPaths}, indirect Y ${stats.totalIndirectLuminance.toExponential(3)}`
@@ -3637,6 +3755,11 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
           return;
         }
         light.root.position.copy(light.position);
+        light.root.rotation.copy(light.rotation);
+        light.direction.set(0,0,-1).applyEuler(light.rotation);
+        light.right.set(1,0,0).applyEuler(light.rotation);
+        light.up.set(0,1,0).applyEuler(light.rotation);
+        light.root.getObjectByName('area-outline')?.scale.set(light.width, light.height, 1);
         light.root.visible = light.visible;
         const bulb = light.root.children[1];
         const halo = light.root.children[0];
@@ -3653,6 +3776,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
           const haloScale = THREE.MathUtils.clamp(0.8 + Math.log10(Math.max(light.intensity, 1) + 1) * 0.32, 0.8, 2.5);
           halo.scale.setScalar(haloScale * helperScale);
         }
+        if (light.type !== 'point') light.root.children[2]?.scale.setScalar(helperScale);
       }
 
       getRenderModeForItem(item) {
@@ -4225,7 +4349,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
           this.state.lightY = light.position.y;
           this.state.lightZ = light.position.z;
           this.syncSelectedLightControls(true);
-          this.refreshLightingModel();
+          this.refreshLightingModel({ geometryChanged: false });
           this.lastRenderFrameAt = 0;
           this.forceVisualRefresh(4);
           return;
@@ -4550,7 +4674,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
           const mainButton = document.createElement("button");
           mainButton.type = "button";
           mainButton.className = "scene-item-main";
-          mainButton.title = "Select this point light.";
+          mainButton.title = "Select this light.";
           mainButton.setAttribute("aria-label", `Select light ${light.name}`);
           mainButton.addEventListener("click", () => this.selectLight(light.id));
 
@@ -4571,7 +4695,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
             toggleButton.classList.add("is-hidden");
           }
           toggleButton.textContent = light.visible ? "On" : "Off";
-          toggleButton.title = "Toggle this point light.";
+          toggleButton.title = "Toggle this light.";
           toggleButton.setAttribute("aria-label", `${light.visible ? "Hide" : "Show"} light ${light.name}`);
           toggleButton.setAttribute("aria-pressed", String(light.visible));
           toggleButton.addEventListener("click", () => this.toggleLightVisibility(light.id));
@@ -4580,7 +4704,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
           deleteButton.type = "button";
           deleteButton.className = "scene-item-button";
           deleteButton.textContent = "Delete";
-          deleteButton.title = "Delete this point light.";
+          deleteButton.title = "Delete this light.";
           deleteButton.setAttribute("aria-label", `Delete light ${light.name}`);
           deleteButton.addEventListener("click", () => this.removeLight(light.id));
 
@@ -4599,13 +4723,15 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
       }
 
       addPointLight() {
-        const light = this.createLightRecord();
+        const type = this.dom.lightTypeSelect.value;
+        const light = this.createLightRecord(type);
         light.position.copy(this.camera.position);
+        if (type !== 'point') light.rotation.copy(this.camera.rotation);
         this.updateLightVisual(light);
         this.sceneLights.push(light);
         this.selectLight(light.id, false);
         this.syncLightList();
-        this.refreshLightingModel({ forceModifierRebuild: true });
+        this.refreshLightingModel({ forceModifierRebuild: true, geometryChanged: false });
         this.updateStatus(`Added ${light.name}`);
       }
 
@@ -4618,7 +4744,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         this.updateLightVisual(light);
         this.syncLightList();
         this.syncTransformGizmo();
-        this.refreshLightingModel();
+        this.refreshLightingModel({ geometryChanged: false });
         this.updateStatus(`${light.name} ${light.visible ? "shown" : "hidden"}`);
       }
 
@@ -4642,7 +4768,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         this.syncLightList();
         this.syncTransformGizmo();
         this.updateTransformGizmoButtons();
-        this.refreshLightingModel({ forceModifierRebuild: true });
+        this.refreshLightingModel({ forceModifierRebuild: true, geometryChanged: false });
         this.updateStatus(`Removed ${light.name}`);
       }
 
@@ -4756,7 +4882,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
           if (this.transformControls.object === light.root) {
             this.transformControls.attach(light.root);
           }
-          this.refreshLightingModel();
+          this.refreshLightingModel({ geometryChanged: false });
           if (commit) {
             this.finishDeferredInteraction();
           } else {
@@ -4766,6 +4892,27 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         if (commit) {
           this.syncSelectedLightControls(true);
         }
+      }
+
+      applySelectedLightShape(commit = false) {
+        const light = this.getSelectedLight();
+        if (!light) return;
+        ['x','y','z'].forEach(axis => {
+          const value = Number(this.dom[`lightR${axis}Input`].value);
+          if (Number.isFinite(value)) light.rotation[axis] = THREE.MathUtils.degToRad(Math.max(-360, Math.min(360, value)));
+        });
+        for (const key of ['width','height']) {
+          const value = Number(this.dom[`light${key[0].toUpperCase()+key.slice(1)}Input`].value);
+          if (Number.isFinite(value)) light[key] = Math.max(0.001, Math.min(10000, value));
+        }
+        this.updateLightVisual(light);
+        this.refreshLightingModel({ geometryChanged: false });
+        if (commit) { this.syncSelectedLightControls(true); this.finishDeferredInteraction(); }
+        else this.startDeferredInteraction();
+      }
+
+      getLightSamples() {
+        return expandLightSamples(this.sceneLights);
       }
 
       collectLightOccluderSamples() {
@@ -4830,8 +4977,17 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
       syncLightingRuntimeState() {
         this.syncVisibleSceneItemTransforms();
         this.lightSceneRoot.updateMatrixWorld(true);
-        const activeLights = this.sceneLights.filter((light) => light.visible);
+        this.sceneLights.forEach(light => {
+          light.root.updateWorldMatrix(true, false);
+          light.root.getWorldPosition(light.position);
+        });
+        const activeLights = this.getLightSamples();
+        this.runtimeLightSamples = activeLights;
         this.activeLightCount = activeLights.length;
+        this.ensureDynoHandleArray(this.lightHandles.types, this.activeLightCount,
+          index => dynoFloat(0, `viewerLightType${index}`));
+        this.ensureDynoHandleArray(this.lightHandles.directions, this.activeLightCount,
+          index => dynoVec3(new THREE.Vector3(0,0,-1), `viewerLightDirection${index}`));
         this.ensureDynoHandleArray(
           this.lightHandles.positions,
           this.activeLightCount,
@@ -4859,9 +5015,9 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         );
         const lightWorldPosition = new THREE.Vector3();
         activeLights.forEach((light, index) => {
-          light.root.updateMatrixWorld(true);
-          light.root.getWorldPosition(lightWorldPosition);
-          light.position.copy(lightWorldPosition);
+          lightWorldPosition.fromArray(lightVector(light.position));
+          this.lightHandles.types[index].value = lightTypeCode(light);
+          this.lightHandles.directions[index].value.fromArray(lightVector(light.direction));
           const lightColor = clampLightColor(light.color ?? DEFAULT_LIGHT_COLOR);
           this.lightHandles.positions[index].value.copy(lightWorldPosition);
           this.lightHandles.intensities[index].value = light.intensity;
@@ -4980,9 +5136,15 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         }
       }
 
-      refreshLightingModel({ forceModifierRebuild = false, occlusionChanged = true } = {}) {
+      refreshLightingModel({ forceModifierRebuild = false, occlusionChanged = true, geometryChanged = true } = {}) {
+        if (this.sceneLights.some(light => light.visible && light.type !== 'point')) {
+          this.state.legacySampledShadow = false;
+          this.state.oneBouncePreview = false;
+          this.syncLegacySampledShadowUi();
+          this.syncOneBouncePreviewUi();
+        }
         this.markStaticBakeStale("Light, opacity, transform, or visibility changed");
-        if (occlusionChanged) this.invalidateLightOcclusion("Light or geometry changed");
+        if (occlusionChanged) this.invalidateLightOcclusion("Light or geometry changed", { geometryChanged });
         const previousLightCount = this.activeLightCount;
         const previousOccluderCount = this.activeOccluderCount;
         this.syncLightingRuntimeState();
@@ -4993,7 +5155,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         if (needsRebuild) {
           this.applyRenderMode(false);
           this.queueSparkSceneUpdate();
-          this.refreshActiveBackendSnapshot("Lighting updated");
+          this.refreshActiveBackendSnapshot("Lighting updated", { appearanceOnly: !geometryChanged || !occlusionChanged });
           return;
         }
         if (this.hoverPointer) {
@@ -5003,7 +5165,7 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         this.invalidateRender();
         this.forceVisualRefresh(2);
         this.queueSparkSceneUpdate();
-        this.refreshActiveBackendSnapshot("Lighting updated");
+        this.refreshActiveBackendSnapshot("Lighting updated", { appearanceOnly: !geometryChanged || !occlusionChanged });
       }
 
       getSceneExposureScale() {
@@ -5459,12 +5621,13 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
         let firstVisibleLight = true;
         const directLinear = applyDirectLighting({
           baseLinearRgb: linear,
-          lights: this.sceneLights.map((light) => {
+          lights: (this.runtimeLightSamples ?? this.getLightSamples()).map((light) => {
             const isFirstVisibleLight = light.visible && firstVisibleLight;
             if (isFirstVisibleLight) {
               firstVisibleLight = false;
             }
             return {
+              type: light.type, direction: light.direction,
               color: light.color,
               intensity: light.intensity,
               position: light.position,
@@ -8625,6 +8788,8 @@ const LIGHT_SHADOW_GPU_SLOT_LIMIT = 32;
                 lightOccluderCount: this.activeOccluderCount,
                 lightOcclusionHandles: this.getLightOcclusionHandles(item),
                 lightPositions: this.lightHandles.positions,
+                lightTypes: this.lightHandles.types,
+                lightDirections: this.lightHandles.directions,
                 occluderOpacities: this.lightHandles.occluderOpacities,
                 occluderPositions: this.lightHandles.occluderPositions,
                 occluderRadii: this.lightHandles.occluderRadii,

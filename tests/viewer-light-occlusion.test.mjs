@@ -173,7 +173,7 @@ test("limits and input contracts reject before expensive indexing or allocation"
   const progress = [];
   await assert.rejects(
     compute(snapshot, tooManyLights, { onProgress: (entry) => progress.push(entry) }),
-    /at most 8 point lights/,
+    /at most 8 light samples/,
   );
   assert.deepEqual(progress, []);
 

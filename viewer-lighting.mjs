@@ -209,7 +209,7 @@ export function evaluateSampledLightTransmission({
 }
 
 /**
- * Returns the linear-RGB irradiance from one direct point light. A missing or
+ * Returns linear-RGB irradiance from a point or directional light sample. A missing or
  * zero-length normal deliberately returns black, and a coincident light has no
  * direction. Imported covariance normals are oriented by the selected policy.
  */
@@ -217,6 +217,8 @@ export function evaluateDirectPointLight({
   intensity = 0,
   lightColor = DEFAULT_LIGHT_COLOR,
   lightPosition,
+  lightDirection,
+  emissionDirection,
   normal,
   normalPolicy = DIRECT_LIGHT_NORMAL_POLICY.AUTHORED_ONE_SIDED,
   position,
@@ -232,7 +234,7 @@ export function evaluateDirectPointLight({
     normalPolicy,
     position,
   });
-  const toLight = [
+  const toLight = lightDirection ? vector3(lightDirection).map(v => -v) : [
     sourcePosition[0] - surfacePosition[0],
     sourcePosition[1] - surfacePosition[1],
     sourcePosition[2] - surfacePosition[2],
@@ -243,7 +245,7 @@ export function evaluateDirectPointLight({
     return [0, 0, 0];
   }
 
-  const safeDistanceSq = Math.max(
+  const safeDistanceSq = lightDirection ? 1 : Math.max(
     rawDistanceSq,
     Math.max(finiteNumber(distanceSqEpsilon, DIRECT_LIGHT_DISTANCE_SQ_EPSILON), Number.EPSILON),
   );
@@ -251,10 +253,15 @@ export function evaluateDirectPointLight({
     dot(surfaceNormal, toLight) / Math.sqrt(normalLengthSq * rawDistanceSq),
     0,
   );
+  const emitterNormal = emissionDirection ? vector3(emissionDirection) : null;
+  const emissionFacing = emitterNormal
+    ? Math.max(-dot(emitterNormal, toLight) / (Math.hypot(...emitterNormal) * Math.sqrt(rawDistanceSq) || 1), 0)
+    : 1;
   const strength = (
     Math.max(finiteNumber(intensity), 0)
     * clamp(finiteNumber(visibility, 1), 0, 1)
     * facing
+    * emissionFacing
   ) / safeDistanceSq;
   const color = linearRgb(lightColor);
   return [color[0] * strength, color[1] * strength, color[2] * strength];
@@ -287,6 +294,8 @@ export function applyDirectLighting({
       intensity: light?.intensity,
       lightColor: light?.color,
       lightPosition: light?.position,
+      lightDirection: light?.type === 'directional' ? light.direction : null,
+      emissionDirection: light?.type === 'area-sample' ? light.direction : null,
       normal,
       normalPolicy,
       position,

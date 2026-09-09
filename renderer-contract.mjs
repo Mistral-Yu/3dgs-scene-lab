@@ -40,15 +40,15 @@ export const RENDERER_MANIFEST = Object.freeze({
   }),
   "three-r186": Object.freeze({
     id: "three-r186",
-    label: "Three.js r186dev",
-    summary: "Instanced anisotropic Gaussian ellipses",
+    label: "Three.js r186",
+    summary: "Official GaussianSplat / WebGPURenderer",
     capabilities: Object.freeze({
       gaussianRenderer: true,
       sh: "SH0 base RGB snapshot",
       directionalCaster: false,
       splatReceivesShadows: false,
       animation: "Spark only",
-      lighting: "CPU appearance snapshot with exposure, lights, bounce, and tone curve",
+      lighting: "GPU appearance with exposure, direct lights, occlusion and tone curve; CPU compatibility for legacy previews",
     }),
   }),
 });

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import * as THREE from "../vendor/three/three.module.js";
+import * as ThreeR186 from "three-r186/webgpu";
 import { GSplatParams } from "../node_modules/playcanvas/build/playcanvas/src/scene/gsplat-unified/gsplat-params.js";
 import { RENDERER_SETTINGS, createRendererSettings, parseRendererSetting, applyThreeRendererSettings, renderRendererSettings, rendererSettingGroup } from "../viewer-renderer-settings.mjs";
 import { LookDevBackendManager } from "../viewer-backends.mjs";
@@ -23,13 +24,15 @@ test("PlayCanvas controls match the installed engine defaults and invoke real se
   assert.equal(params.dataFormat, "large");
 });
 
-test("invalid numeric and enum settings are rejected, including empty fields", () => {
+test("invalid numeric and checkbox settings are rejected, including empty fields", () => {
   const alpha = RENDERER_SETTINGS.spark.fields.find((f) => f.key === "minAlpha");
   for (const value of ["", " ", "NaN", "Infinity", "-0.1", "1.1"]) assert.equal(parseRendererSetting(alpha, value), null);
   assert.equal(parseRendererSetting(alpha, "0"), 0);
-  const tone = RENDERER_SETTINGS["three-r186"].fields[0];
-  assert.equal(parseRendererSetting(tone, "ACESFilmicToneMapping"), "ACESFilmicToneMapping");
-  assert.equal(parseRendererSetting(tone, "constructor"), null);
+  const threeFields = RENDERER_SETTINGS["three-r186"].fields;
+  assert.deepEqual(threeFields.map((field) => field.key), ["sortObjects", "depthTest", "wireframe"]);
+  assert.equal(parseRendererSetting(threeFields[0], true), true);
+  assert.equal(parseRendererSetting(threeFields[0], false), false);
+  assert.equal(parseRendererSetting(threeFields[0], "true"), null);
 });
 
 test("LoD budget accepts automatic and integer counts without inventing a platform default", () => {
@@ -94,7 +97,7 @@ test("a stationary PlayCanvas view is rebuilt when its sorting metric changes", 
   backend.settings.radialSorting = true;
   const calls = [];
   backend.dispose = () => { calls.push("dispose"); backend.app = null; backend.hasSnapshot = false; };
-  backend.ensure = (target) => { assert.equal(target, stage); calls.push("ensure"); backend.app = { scene: { gsplat: {} } }; };
+  backend.createApplication = (target) => { assert.equal(target, stage); calls.push("ensure"); backend.app = { scene: { gsplat: {} } }; };
   backend.syncSnapshot = (value) => { assert.equal(value, snapshot); calls.push("snapshot"); };
   backend.applySettings();
   assert.deepEqual(calls, ["dispose", "ensure", "snapshot"]);
@@ -104,32 +107,28 @@ test("a stationary PlayCanvas view is rebuilt when its sorting metric changes", 
 test("renderer values survive disposal and default reset does not leak across engines", () => {
   const manager = new LookDevBackendManager({ inputCanvas: { classList: { toggle() {} } } });
   const backend = manager.backends.get("three-r186");
-  backend.settings.toneMappingExposure = 2;
+  backend.settings.sortObjects = false;
   backend.dispose();
-  assert.equal(backend.settings.toneMappingExposure, 2);
+  assert.equal(backend.settings.sortObjects, false);
   Object.assign(backend.settings, createRendererSettings("three-r186"));
-  assert.equal(backend.settings.toneMappingExposure, 1);
+  assert.equal(backend.settings.sortObjects, true);
   assert.equal(manager.backends.get("playcanvas").settings.minPixelSize, 2);
 });
 
-test("Three controls set renderer properties and actual material flags", () => {
-  const backend = { renderer: {}, material: new THREE.ShaderMaterial(), settings: createRendererSettings("three-r186") };
-  assert.equal(backend.material.depthTest, backend.settings.depthTest);
-  assert.equal(backend.material.wireframe, backend.settings.wireframe);
-  backend.settings.toneMapping = "ACESFilmicToneMapping";
-  backend.settings.toneMappingExposure = 2;
+test("Three controls preserve official encoded compositing and material flags", () => {
+  const backend = { renderer: {}, material: { depthTest: true, wireframe: false }, settings: createRendererSettings("three-r186") };
+  backend.settings.sortObjects = false;
   backend.settings.depthTest = false;
   backend.settings.wireframe = true;
-  backend.material.uniforms = { gaussianCutoff: { value: 3 }, alphaCutoff: { value: 0 }, preBlurVariance: { value: 0 } };
-  backend.settings.gaussianCutoff = 2;
-  backend.settings.alphaCutoff = 0.1;
-  applyThreeRendererSettings(backend, THREE);
-  assert.equal(backend.renderer.toneMapping, THREE.ACESFilmicToneMapping);
-  assert.equal(backend.renderer.toneMappingExposure, 2);
+  applyThreeRendererSettings(backend, ThreeR186);
+  assert.equal(backend.renderer.toneMapping, ThreeR186.NoToneMapping);
+  assert.equal(backend.renderer.toneMappingExposure, 1);
+  assert.equal(backend.renderer.sortObjects, false);
   assert.equal(backend.material.depthTest, false);
   assert.equal(backend.material.wireframe, true);
-  assert.equal(backend.material.uniforms.gaussianCutoff.value, 2);
-  assert.equal(backend.material.uniforms.alphaCutoff.value, 0.1);
+  for (const key of ["toneMapping", "toneMappingExposure", "gaussianCutoff", "alphaCutoff", "preBlurVariance"]) {
+    assert.equal(key in backend.settings, false, key);
+  }
 });
 
 const source = readFileSync(new URL("../viewer.js", import.meta.url), "utf8");

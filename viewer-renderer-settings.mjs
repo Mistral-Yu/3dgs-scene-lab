@@ -1,5 +1,5 @@
 // Defaults verified against Spark 2.1.0, PlayCanvas 2.22.0 and the pinned
-// Three.js r186dev source. Limits are UI guardrails, not upstream API limits.
+// Three.js r186 source. Limits are UI guardrails, not upstream API limits.
 const number = (key, value, min, max, step, note) => ({ key, value, min, max, step, note, type: "number" });
 const checkbox = (key, value, note) => ({ key, value, note, type: "checkbox" });
 
@@ -36,7 +36,7 @@ export const RENDERER_SETTINGS = {
   },
   playcanvas: {
     source: "https://api.playcanvas.com/engine/classes/GSplatParams.html",
-    note: "PlayCanvas 2.22.0 GSplatParams defaults. This viewer uses WebGL / CPU sorting and flat scene snapshots. WebGPU-only and streamed-LoD settings are omitted.",
+    note: "PlayCanvas 2.22.0 GSplatParams defaults. WebGPU is preferred, with WebGL2 compatibility. Scene snapshots remain flat; streamed-LoD controls are omitted.",
     fields: [
       { key: "dataFormat", value: "compact", type: "select", options: ["compact", "large"], note: "Work-buffer precision: compact uses 20 bytes/splat; large uses 32 bytes/splat and higher precision. Increasing precision costs GPU memory." },
       checkbox("antiAlias", false, "Enable Gaussian antialiasing with opacity compensation."),
@@ -45,22 +45,17 @@ export const RENDERER_SETTINGS = {
       number("alphaClipForward", 1 / 255, 0, 1, 0.0001, "Discard forward-rendered fragments below this alpha value."),
       checkbox("twoDimensional", false, "Enable the 2D Gaussian rendering path; intended for 2DGS data."),
     ],
-    unavailable: "This WebGL/CPU-sort snapshot path cannot use the WebGPU-only minContribution, foveationStrength or foveationCenter controls. Streamed-LoD splatBudget, lodMode, lodBehindPenalty, lodUnderfillLimit and cooldownTicks do not apply to flat snapshots. Source SH is reduced to SH0, so colorUpdateAngle does not improve it. alphaClip affects shadow/pick/prepasses, which this backend does not provide. The renderer pipeline is fixed to WebGL CPU sorting.",
+    unavailable: "WebGPU minContribution, foveationStrength and foveationCenter are not exposed in this panel. Streamed-LoD splatBudget, lodMode, lodBehindPenalty, lodUnderfillLimit and cooldownTicks do not apply to flat snapshots. Source SH is reduced to SH0, so colorUpdateAngle does not improve it. alphaClip affects shadow/pick/prepasses, which this backend does not provide. WebGL2 is the compatibility path when WebGPU is unavailable.",
   },
   "three-r186": {
-    source: "https://threejs.org/docs/pages/WebGLRenderer.html",
-    note: "Three.js WebGLRenderer defaults. Gaussian ellipses are this viewer's custom shader, not an official Three.js splat renderer. Exposure below is additional to the shared Splats exposure and only works with tone mapping enabled.",
+    source: "https://threejs.org/docs/pages/GaussianSplat.html",
+    note: "Official Three.js r186 GaussianSplat. WebGPU counting sort; WebGL2 uses the official CPU sort fallback. Shared appearance is controlled in Splats and Light.",
     fields: [
-      { key: "toneMapping", value: "NoToneMapping", type: "select", note: "Output tone mapper. None preserves the shared appearance snapshot.", options: ["NoToneMapping", "LinearToneMapping", "ReinhardToneMapping", "CineonToneMapping", "ACESFilmicToneMapping", "AgXToneMapping", "NeutralToneMapping"] },
-      number("toneMappingExposure", 1, 0, 10, 0.05, "Exposure multiplier for the selected tone mapper."),
-      checkbox("sortObjects", true, "Sort Three.js objects before drawing; individual splats retain their own depth sort."),
-      checkbox("depthTest", true, "Material depth testing against opaque helpers and geometry. Official Material default: on."),
-      checkbox("wireframe", false, "Show the triangle edges of the Gaussian quads. Official ShaderMaterial default: off."),
-      number("gaussianCutoff", 3, 0.1, 6, 0.1, "Viewer shader default: 3 standard deviations. Smaller support reduces overdraw but trims Gaussian edges; not an official Three.js parameter."),
-      number("alphaCutoff", 0, 0, 1, 0.001, "Viewer shader default: 0. Discard fragments below this alpha threshold; higher values trim translucent edges."),
-      number("preBlurVariance", 0, 0, 10, 0.01, "Viewer shader default: 0. Add projected covariance blur in pixel-squared units; no opacity compensation."),
+      checkbox("sortObjects", true, "Sort scene objects; all splats share one global GaussianSplat sort."),
+      checkbox("depthTest", true, "Depth testing against opaque helpers and geometry."),
+      checkbox("wireframe", false, "Show the edges of the official Gaussian quads."),
     ],
-    unavailable: "This custom shader has no built-in LoD, SH1–SH3 or GPU sorting. WebGL context options antialias and precision require context recreation and stay at the existing false/highp settings. Global Gaussian depth sorting is separate from sortObjects. Shadow-map settings have no effect on these splats.",
+    unavailable: "The official addon fixes Gaussian support at 2 standard deviations and antialiasing kernel variance at 0.3; it exposes no cutoff, alpha threshold or blur controls. Shared snapshots currently carry SH0, not source SH1–SH3. No LoD or native shadow maps. WebGL2 uses CPU appearance compatibility. Extra output tone mapping is omitted to preserve display-encoded splat compositing.",
   },
 };
 
@@ -86,14 +81,11 @@ export function parseRendererSetting(field, raw) {
 export function applyThreeRendererSettings(backend, namespace) {
   const { renderer, material, settings } = backend;
   if (!renderer || !material) return;
-  renderer.toneMapping = namespace[settings.toneMapping];
-  renderer.toneMappingExposure = settings.toneMappingExposure;
+  renderer.toneMapping = namespace.NoToneMapping;
+  renderer.toneMappingExposure = 1;
   renderer.sortObjects = settings.sortObjects;
   material.depthTest = settings.depthTest;
   material.wireframe = settings.wireframe;
-  for (const key of ["gaussianCutoff", "alphaCutoff", "preBlurVariance"]) {
-    if (material.uniforms[key]) material.uniforms[key].value = settings[key];
-  }
 }
 
 // Keep the native details element (and its open state) while switching engines.

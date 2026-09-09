@@ -43,7 +43,7 @@
             <select id="backend-select">
               <option value="spark" selected>Spark 2.1</option>
               <option value="playcanvas">PlayCanvas 2.22.0</option>
-              <option value="three-r186">Three.js r186dev</option>
+              <option value="three-r186">Three.js r186</option>
             </select>
           </label>
           <details id="renderer-settings" class="options-disclosure renderer-settings">
@@ -206,7 +206,7 @@
             <div class="hud-cluster">
               <span class="hud-chip" id="lens-chip">28 mm</span>
               <span class="hud-chip" id="speed-chip">1.00 u/s</span>
-              <span class="hud-chip" id="colorspace-chip" title="Display output is sRGB. Color grading, authored primitive colors, and point-light math use linear sRGB.">Display sRGB</span>
+              <span class="hud-chip" id="colorspace-chip" title="Display output is sRGB. Color grading, authored primitive colors, and light math use linear sRGB.">Display sRGB</span>
             </div>
             <div class="hud-cluster">
               <span class="hud-chip" id="fps-chip">FPS -</span>
@@ -256,7 +256,7 @@
           <div class="inspector-tabs" role="tablist" aria-label="Inspector tabs">
             <button class="segmented-button is-active" type="button" id="tab-scene-button" data-inspector-tab="scene" role="tab" aria-selected="true" aria-controls="inspector-scene" tabindex="0" title="Splat item visibility, selection, transforms, and render controls.">Splats</button>
             <button class="segmented-button" type="button" id="tab-color-button" data-inspector-tab="color" role="tab" aria-selected="false" aria-controls="inspector-color" tabindex="-1" title="Linear color grading controls.">Color</button>
-            <button class="segmented-button" type="button" id="tab-light-button" data-inspector-tab="light" role="tab" aria-selected="false" aria-controls="inspector-light" tabindex="-1" title="Manage point lights that relight visible splats in beauty mode.">Light</button>
+            <button class="segmented-button" type="button" id="tab-light-button" data-inspector-tab="light" role="tab" aria-selected="false" aria-controls="inspector-light" tabindex="-1" title="Manage Point, Area, and Directional lights in beauty mode.">Light</button>
             <button class="segmented-button" type="button" id="tab-animation-button" data-inspector-tab="animation" role="tab" aria-selected="false" aria-controls="inspector-animation" tabindex="-1" title="Load, edit, save, and play per-splat animation scripts.">Animate</button>
             <button class="segmented-button" type="button" id="tab-align-button" data-inspector-tab="align" role="tab" aria-selected="false" aria-controls="inspector-align" tabindex="-1" title="Place matching markers on two splats and rigid-align one to the other.">Align</button>
             <button class="segmented-button" type="button" id="tab-brush-button" data-inspector-tab="brush" role="tab" aria-selected="false" aria-controls="inspector-brush" tabindex="-1" title="Edit Gaussian splats directly with Move and Standard brushes.">Brush</button>
@@ -639,26 +639,31 @@
 
             <section class="inspector-panel" id="inspector-light" data-inspector-panel="light" role="tabpanel" aria-labelledby="tab-light-button" hidden>
               <div class="field-stack">
-                <div class="button-stack">
-                  <button class="toolbar-button" type="button" id="add-point-light-button" title="Add a new point light to the scene.">Add Point Light</button>
+                <div class="field-inline">
+                  <select id="light-type-select" aria-label="New light type">
+                    <option value="point">Point</option>
+                    <option value="area">Area</option>
+                    <option value="directional">Directional</option>
+                  </select>
+                  <button class="toolbar-button" type="button" id="add-point-light-button" aria-label="Add Light" title="Add the selected type of light at the camera.">Add</button>
                 </div>
                 <div class="scene-list" id="light-list"></div>
-                <p class="scene-empty" id="light-empty">No point lights in the scene.</p>
+                <p class="scene-empty" id="light-empty">No lights in the scene.</p>
               </div>
 
               <div class="field-stack" id="light-controls-section" hidden>
                 <p class="info-item-name" id="light-name">No light selected</p>
                 <div class="button-stack">
-                  <button class="toolbar-button" type="button" id="light-gizmo-button" title="Show or hide the move gizmo for the selected point light.">Move Gizmo Off</button>
+                  <button class="toolbar-button" type="button" id="light-gizmo-button" title="Show or hide the move gizmo for the selected light.">Move Gizmo Off</button>
                 </div>
-                <label class="field" title="Adjust point-light intensity. Values above the slider range can be typed directly.">
+                <label class="field" title="Point: inverse-square strength. Directional: distance-independent strength. Area: total normalized strength shared by four one-sided samples; size does not multiply energy.">
                   <span>Intensity</span>
                   <div class="field-inline">
                     <input id="light-intensity-range" type="range" min="0" max="100" step="0.1" value="20">
                     <input class="text-input short-input" id="light-intensity-input" type="text" inputmode="decimal" value="20.0">
                   </div>
                 </label>
-                <label class="field" title="Scale the displayed point-light helper only. This does not change lighting calculations.">
+                <label class="field" title="Scale the light marker and direction arrow only. The area outline retains its actual width/height.">
                   <span>Helper Size</span>
                   <div class="field-inline">
                     <input id="light-helper-scale-range" type="range" min="0.1" max="8" step="0.05" value="0.1">
@@ -666,15 +671,15 @@
                   </div>
                 </label>
                 <div class="transform-row">
-                  <label class="field" title="Linear sRGB red channel for the selected point light.">
+                  <label class="field" title="Linear sRGB red channel for the selected light.">
                     <span>R</span>
                     <input class="text-input" id="light-r-input" type="text" inputmode="decimal" value="1.000">
                   </label>
-                  <label class="field" title="Linear sRGB green channel for the selected point light.">
+                  <label class="field" title="Linear sRGB green channel for the selected light.">
                     <span>G</span>
                     <input class="text-input" id="light-g-input" type="text" inputmode="decimal" value="0.700">
                   </label>
-                  <label class="field" title="Linear sRGB blue channel for the selected point light.">
+                  <label class="field" title="Linear sRGB blue channel for the selected light.">
                     <span>B</span>
                     <input class="text-input" id="light-b-input" type="text" inputmode="decimal" value="0.450">
                   </label>
@@ -693,10 +698,29 @@
                     <input class="text-input" id="light-z-input" type="text" inputmode="decimal" value="0">
                   </label>
                 </div>
+                <div class="transform-row" id="light-rotation-fields" hidden>
+                  <label class="field" title="Rotate about local X in degrees (XYZ Euler); light emits along local -Z.">
+                    <span>RX °</span><input class="text-input" id="light-rx-input" type="text" inputmode="decimal" value="0">
+                  </label>
+                  <label class="field" title="Rotate about local Y in degrees. Directional light position moves its helper only.">
+                    <span>RY °</span><input class="text-input" id="light-ry-input" type="text" inputmode="decimal" value="0">
+                  </label>
+                  <label class="field" title="Rotate about local Z in degrees (XYZ Euler).">
+                    <span>RZ °</span><input class="text-input" id="light-rz-input" type="text" inputmode="decimal" value="0">
+                  </label>
+                </div>
+                <div class="button-pair" id="light-area-fields" hidden>
+                  <label class="field" title="Rectangle width in native scene units; four-sample soft-shadow approximation.">
+                    <span>Width</span><input class="text-input" id="light-width-input" type="text" inputmode="decimal" value="1">
+                  </label>
+                  <label class="field" title="Rectangle height in native scene units.">
+                    <span>Height</span><input class="text-input" id="light-height-input" type="text" inputmode="decimal" value="1">
+                  </label>
+                </div>
               </div>
 
               <div class="field-stack compact-fields" id="light-occlusion-section">
-                <label class="field field-toggle" title="Cache Gaussian-sphere transmittance from all visible splats for every visible point light. Updates after edits; original RGB stays unchanged. Spark only, no animation, up to 8 lights and 8 million splat-light pairs. This is an approximate shadow, not physical GI.">
+                <label class="field field-toggle" title="All-splat Gaussian-sphere shadows on all renderers. Up to 8 shadow samples / 8M splat-sample pairs; Point and Directional use 1, Area uses 4. No animation or physical GI.">
                   <span>Occlusion</span>
                   <input id="light-occlusion-checkbox" type="checkbox">
                 </label>

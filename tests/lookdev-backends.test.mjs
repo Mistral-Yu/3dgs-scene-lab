@@ -396,7 +396,7 @@ test("manifest advertises only implemented Gaussian capabilities", () => {
   assert.equal(RENDERER_MANIFEST["three-r186"].capabilities.animation, "Spark only");
 });
 
-test("alternate adapters use actual GSplat and r186 covariance shader paths", () => {
+test("alternate adapters use actual GSplat and official r186 sorting", () => {
   const source = read("viewer-backends.mjs");
   assert.match(source, /new PlayCanvas\.GSplatData/);
   assert.match(source, /new PlayCanvas\.GSplatResource/);
@@ -409,8 +409,7 @@ test("alternate adapters use actual GSplat and r186 covariance shader paths", ()
   assert.match(source, /syncSnapshot\(snapshot\)[\s\S]*?this\.needsSystemUpdate \|\|= placementsChanged;/);
   assert.match(source, /resourcesById[\s\S]*?resource\.updateColorData\(data\);[\s\S]*?resource\.updateTransformData\(data\);[\s\S]*?workBufferUpdate = PlayCanvas\.WORKBUFFER_UPDATE_ONCE;/);
   assert.match(source, /const nextResources = visibleItems\.map[\s\S]*?resourcesById\.forEach[\s\S]*?this\.resources = nextResources;/);
-  assert.match(source, /if \(!topologyMatches && this\.hasSnapshot\) \{[\s\S]*?this\.dispose\(\);[\s\S]*?this\.ensure\(stage\);[\s\S]*?this\.syncSnapshot\(snapshot\);/);
-  assert.match(source, /syncSnapshot\(snapshot\)[\s\S]*?this\.sortByCamera\(this\.camera\);/);
+  assert.match(source, /if \(!topologyMatches && this\.hasSnapshot && !this\.app\.graphicsDevice\.isWebGPU\) \{[\s\S]*?this\.dispose\(\);[\s\S]*?this\.createApplication\(stage\);[\s\S]*?this\.syncSnapshot\(snapshot\);/);
   assert.match(source, /syncFrame\([\s\S]*?if \(this\.needsSystemUpdate\) \{[\s\S]*?this\.app\.update\(0\);/);
   assert.match(source, /syncFrame\([\s\S]*?this\.app\.fire\("framerender"\);[\s\S]*?this\.app\.render\(\)/);
   assert.match(source, /this\.app\.render\(\)/);
@@ -418,22 +417,16 @@ test("alternate adapters use actual GSplat and r186 covariance shader paths", ()
   assert.match(source, /if \(helpers\?\.showGrid\)/);
   assert.match(source, /if \(helpers\?\.showBounds && helpers\.bounds\)/);
   assert.match(source, /ThreeR186\.REVISION !== EXPECTED_THREE_REVISION/);
-  assert.match(source, /attribute vec3 splatCovarianceDiagonal;/);
-  assert.match(source, /attribute vec3 splatCovarianceOffDiagonal;/);
-  assert.match(source, /mat3 covariance3d = viewRotation \* covarianceWorld \* transpose\(viewRotation\)/);
-  assert.match(source, /setAttribute\("splatCovarianceDiagonal", this\.sortedAttributes\.covarianceDiagonal\)/);
-  assert.match(source, /setAttribute\("splatCovarianceOffDiagonal", this\.sortedAttributes\.covarianceOffDiagonal\)/);
-  assert.match(source, /this\.sorted\.covarianceDiagonal\[output3\] = this\.flat\.covarianceDiagonal\[source3\]/);
-  assert.match(source, /this\.sorted\.covarianceOffDiagonal\[output3\] = this\.flat\.covarianceOffDiagonal\[source3\]/);
-  assert.doesNotMatch(source, /splatQuaternion|splatScale|quaternionMatrix/);
-  assert.match(source, /exp\(-0\.5 \* radiusSquared\)/);
-  assert.match(source, /order\.sort/);
-  assert.doesNotMatch(source, /\.filter\(\(_, index\) => index %/);
-  assert.match(source, /this\.sortedAttributes = \{/);
-  assert.match(source, /syncItemTransforms\(items\)[\s\S]*?updateFlattenedSnapshotItemTransforms/);
-  assert.match(source, /this\.order = new Uint32Array\(this\.flat\.count\)/);
-  assert.match(source, /this\.sortedAttributes\.center\.needsUpdate = true/);
-  assert.doesNotMatch(source.match(/sortByCamera\(sourceCamera\) \{[\s\S]*?\n  \}/)?.[0] ?? "", /new ThreeR186\.InstancedBufferAttribute/);
+  assert.match(source, /this\.flat = flattenVisibleSnapshot\(snapshot, \{ includeQuaternion: false, includeCovariance: true \}\)/);
+  assert.match(source, /new ThreeR186\.GaussianSplat\(geometry, \{ autoSort: false \}\)/);
+  assert.match(source, /ThreeR186\.createNativeAppearance\(this\.mesh, this\.flat,/);
+  assert.match(source, /syncItemTransforms\(items\)[\s\S]*?ThreeR186\.updateNativeGeometry\(this\.mesh, this\.flat\);/);
+  assert.match(source, /this\.mesh\?\.updateSort\(this\.renderer, this\.camera\);/);
+  assert.match(source, /ThreeR186\.disposeNativeSplat\(this\.mesh\);/);
+  assert.doesNotMatch(source, /attribute vec3 splatCovarianceDiagonal;/);
+  assert.doesNotMatch(source, /attribute vec3 splatCovarianceOffDiagonal;/);
+  assert.doesNotMatch(source, /sortByCamera\(sourceCamera\)/);
+  assert.doesNotMatch(source, /new ThreeR186\.InstancedBufferAttribute/);
   assert.match(source, /this\.backends\.get\(previousId\)\?\.dispose\(\)/);
   assert.doesNotMatch(source, /ThreeR186\.Points|new ThreeR186\.Points/);
 });
@@ -442,6 +435,7 @@ test("alternate renderer vendors load as separate classic bundles only when sele
   const source = read("viewer-backends.mjs");
   const playCanvasEntry = read("viewer-vendor-playcanvas.mjs");
   const threeEntry = read("viewer-vendor-three-r186.mjs");
+  const threeBuild = read("tools/build-three-r186.mjs");
   const packageJson = JSON.parse(read("package.json"));
 
   assert.doesNotMatch(source, /^import \* as PlayCanvas from "playcanvas";/m);
@@ -454,14 +448,27 @@ test("alternate renderer vendors load as separate classic bundles only when sele
   assert.match(source, /activationToken !== this\.activationToken/);
   assert.match(playCanvasEntry, /import \* as PlayCanvas from "playcanvas"/);
   assert.match(playCanvasEntry, /__SPATIAL_LOOKDEV_PLAYCANVAS__/);
-  assert.match(threeEntry, /import \* as ThreeR186 from "three-r186"/);
+  assert.match(threeEntry, /import \* as ThreeR186 from "three-r186\/webgpu"/);
+  assert.match(threeEntry, /import \{ GaussianSplat \} from "three-r186\/addons\/objects\/GaussianSplat\.js"/);
+  assert.match(threeEntry, /ThreeR186\.ColorManagement\.workingColorSpace = ThreeR186\.SRGBColorSpace/);
   assert.match(threeEntry, /__SPATIAL_LOOKDEV_THREE_R186__/);
   assert.match(packageJson.scripts.build, /build:main/);
   assert.match(packageJson.scripts.build, /build:vendor:playcanvas/);
   assert.match(packageJson.scripts.build, /build:vendor:three-r186/);
   assert.match(packageJson.scripts["build:main"], /--minify/);
   assert.match(packageJson.scripts["build:vendor:playcanvas"], /--minify/);
-  assert.match(packageJson.scripts["build:vendor:three-r186"], /--minify/);
+  assert.equal(packageJson.scripts["build:vendor:three-r186"], "node tools/build-three-r186.mjs");
+  assert.match(threeBuild, /minify:\s*true/);
+});
+
+test("native helper recreation resets the remembered grid subdivision count", async () => {
+  const ThreeR186 = await import('three-r186/webgpu');
+  const body = read('viewer-backends.mjs').match(/  createHelpers\(\) \{([\s\S]*?)\n  \}\n\n  applySettings/)[1];
+  const backend = {scene:new ThreeR186.Scene(),gridDivisions:5,applySettings(){}};
+  new Function('ThreeR186',body).call(backend,ThreeR186);
+  assert.equal(backend.gridDivisions,10);
+  assert.equal(backend.gridHelper.geometry.getAttribute('position').count,44);
+  for(const helper of backend.scene.children){helper.geometry.dispose();helper.material.dispose();}
 });
 
 test("lazy backend loader resolves a file-relative classic script namespace", async () => {
@@ -506,10 +513,10 @@ test("lazy backend loader resolves a file-relative classic script namespace", as
 
 test("Spark avoids renderer snapshots until an alternate backend is selected", () => {
   const source = read("viewer.js");
-  assert.match(source, /refreshActiveBackendSnapshot\(reason = "scene updated", \{ force = false, syncActive = true \} = \{\}\)/);
+  assert.match(source, /refreshActiveBackendSnapshot\(reason = "scene updated", \{ force = false, syncActive = true, appearanceOnly = false \} = \{\}\)/);
   assert.match(source, /if \(!force && this\.backendManager\.isSparkActive\(\)\) return;/);
   assert.match(source, /setSnapshot\(this\.captureRendererSnapshot\(\), \{ syncActive \}\);[\s\S]*?if \(syncActive\) this\.forceVisualRefresh\(2\);/);
-  assert.match(source, /getSnapshot: \(\) => this\.captureRendererSnapshot\(\)/);
+  assert.match(source, /getSnapshot: \(options\) => this\.captureRendererSnapshot\(options\)/);
   assert.match(source, /createSceneSnapshot\(this\.sceneItems, \{[\s\S]*?mapLinearRgb:[\s\S]*?visibleOnly: true/);
   assert.match(source, /syncActiveBackendItemTransforms\(\)[\s\S]*?pendingActiveBackendTransformSync = true;[\s\S]*?invalidateRender\(\)/);
   assert.match(source, /flushActiveBackendItemTransforms\(\)[\s\S]*?backendManager\.syncItemTransforms/);
@@ -583,6 +590,26 @@ test('a successful switch disposes the old renderer only after the replacement i
   assert.ok(events.indexOf('three-r186:snapshot') < events.indexOf('playcanvas:dispose'));
 });
 
+test('GPU device initialization captures the latest snapshot and ignores a superseded activation', async () => {
+  for (const superseded of [false,true]) {
+    const { manager, playcanvas } = makeBackendManager();
+    let release, entered;
+    const gate = new Promise(resolve => { release=resolve; });
+    const ready = new Promise(resolve => { entered=resolve; });
+    playcanvas.supportsGpuAppearance = true;
+    playcanvas.ensure = async () => { playcanvas.canvas=makeCanvasStub(); entered(); await gate; };
+    let reads=0;
+    const latest={items:[],splatCount:7};
+    const pending=manager.setActive('playcanvas',{getSnapshot(options){reads++;assert.equal(options.gpuAppearance,true);return latest;}});
+    await ready; assert.equal(reads,0);
+    if(superseded)await manager.setActive('spark');
+    release();assert.equal(await pending,!superseded);
+    assert.equal(reads,superseded?0:1);
+    if(superseded)assert.equal(playcanvas.disposed,1);
+    else assert.equal(manager.snapshot,latest);
+  }
+});
+
 test('a delayed vendor load captures the latest scene once, after loading', async () => {
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
@@ -640,7 +667,7 @@ test("tool UI exposes one concise global backend selector before Camera", () => 
   assert.doesNotMatch(markup, /live look-dev|Spark effects unavailable/);
 });
 
-test("package pins PlayCanvas and the exact HTTPS r186dev commit", () => {
+test("package pins PlayCanvas and the exact official Three.js r186 alias", () => {
   const packageJson = JSON.parse(read("package.json"));
   assert.equal(packageJson.name, "3dgs-scene-lab");
   const lockfile = JSON.parse(read("package-lock.json"));
@@ -649,7 +676,8 @@ test("package pins PlayCanvas and the exact HTTPS r186dev commit", () => {
   assert.equal(packageJson.dependencies.playcanvas, "2.22.0");
   assert.equal(
     packageJson.dependencies["three-r186"],
-    "https://codeload.github.com/mrdoob/three.js/tar.gz/283a3b359d70bf6dc7b54bc129698fbb32be49a9",
+    "npm:three@0.186.0",
   );
+  assert.equal(lockfile.packages["node_modules/three-r186"].version, "0.186.0");
   assert.match(packageJson.scripts["build:main"], /external:node:worker_threads/);
 });

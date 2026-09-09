@@ -7,8 +7,10 @@ import {
 } from "./renderer-contract.mjs";
 import { linearToSrgbChannel } from "./viewer-color.mjs";
 import { createRendererSettings, applyThreeRendererSettings } from "./viewer-renderer-settings.mjs";
+import { APPEARANCE_WIDTH, PC_APPEARANCE_MODIFIER, appearanceSupported,
+  packAppearance, packAppearanceReceivers, updateAppearanceVisibility } from "./viewer-gpu-appearance.mjs";
 
-const EXPECTED_THREE_REVISION = "186dev";
+const EXPECTED_THREE_REVISION = "186";
 const BACKEND_VENDOR_DEFINITIONS = Object.freeze({
   playcanvas: Object.freeze({
     globalName: "__SPATIAL_LOOKDEV_PLAYCANVAS__",
@@ -20,6 +22,8 @@ const BACKEND_VENDOR_DEFINITIONS = Object.freeze({
   }),
 });
 const backendVendorPromises = new Map();
+const appearanceIdentity = state => ({ ...state, visibility: state.visibility
+  ? { data: state.visibility.data, lightIds: [...state.visibility.lightIds] } : null });
 let PlayCanvas = globalThis.__SPATIAL_LOOKDEV_PLAYCANVAS__ ?? null;
 let ThreeR186 = globalThis.__SPATIAL_LOOKDEV_THREE_R186__ ?? null;
 
@@ -151,7 +155,8 @@ const setEntityTransform = (entity, worldMatrix) => {
 };
 
 class PlayCanvasBackend {
-  constructor({ onFrameRequest = null } = {}) {
+  get supportsGpuAppearance() { return true; }
+  constructor({ onFrameRequest = null, onError = null } = {}) {
     this.settings = createRendererSettings("playcanvas");
     this.canvas = null;
     this.app = null;
@@ -160,21 +165,51 @@ class PlayCanvasBackend {
     this.resources = [];
     this.needsSystemUpdate = false;
     this.onFrameRequest = onFrameRequest;
+    this.onError = onError;
     this.frameRequestEvent = null;
     this.sortReadyEvent = null;
     this.hasSnapshot = false;
+    this.lifecycle = 0;
+    this.initializing = null;
+    this.rebuilding = null;
   }
 
-  ensure(stage) {
-    if (this.app) {
-      return;
-    }
-    this.canvas = document.createElement("canvas");
+  async ensure(stage) {
+    if (this.app) return true;
+    if (this.initializing) return this.initializing;
+    const lifecycle = ++this.lifecycle;
+    const canvas = document.createElement("canvas");
+    const pending = (async () => {
+      const device = globalThis.navigator?.gpu
+        ? await PlayCanvas.createGraphicsDevice(canvas, {
+          deviceTypes: [PlayCanvas.DEVICETYPE_WEBGPU], antialias: false, alpha: false,
+          powerPreference: "high-performance",
+        })
+        : null;
+      if (lifecycle !== this.lifecycle) { device?.destroy(); return false; }
+      if (device?.deviceType === PlayCanvas.DEVICETYPE_NULL) {
+        device.destroy(); throw new Error("No usable PlayCanvas graphics device");
+      }
+      this.createApplication(stage, device, canvas);
+      return true;
+    })();
+    this.initializing = pending;
+    try { return await pending; }
+    finally { if (this.initializing === pending) this.initializing = null; }
+  }
+
+  createApplication(stage, graphicsDevice = null, canvas = null) {
+    this.canvas = canvas ?? document.createElement("canvas");
     this.canvas.className = "lookdev-backend-canvas";
     this.canvas.dataset.backendCanvas = "playcanvas";
     stage.append(this.canvas);
     this.app = new PlayCanvas.Application(this.canvas, {
+      ...(graphicsDevice ? { graphicsDevice } : {}),
       graphicsDeviceOptions: { antialias: false, alpha: false, powerPreference: "high-performance" },
+    });
+    this.canvas.dataset.graphicsApi = this.app.graphicsDevice.isWebGPU ? "webgpu" : "webgl2";
+    this.app.graphicsDevice.wgpu?.addEventListener('uncapturederror', event => {
+      console.error('PlayCanvas WebGPU:', event.error.message);
     });
     // PlayCanvas defaults to resizing its canvas against the browser window.
     // This viewer embeds the canvas in a stage, so window-sized inline CSS
@@ -206,13 +241,13 @@ class PlayCanvasBackend {
   }
 
   applySettings() {
-    if (this.app && this.hasSnapshot && this.app.scene.gsplat.radialSorting !== this.settings.radialSorting) {
+    if (this.app && !this.app.graphicsDevice?.isWebGPU && this.hasSnapshot && this.app.scene.gsplat.radialSorting !== this.settings.radialSorting) {
       // CPU sorting is otherwise triggered by camera/placement changes. Recreate
       // through public APIs so changing the metric also sorts a stationary view.
       const stage = this.canvas.parentElement;
       const snapshot = this.settingsSnapshot;
       this.dispose();
-      this.ensure(stage);
+      this.createApplication(stage);
       this.syncSnapshot(snapshot);
       this.canvas.classList.add("is-active-backend");
     }
@@ -221,7 +256,8 @@ class PlayCanvasBackend {
   }
 
   clear() {
-    this.resources.forEach(({ entity, resource }) => {
+    this.resources.forEach(({ entity, resource, appearance }) => {
+      appearance?.params.destroy(); appearance?.receivers.destroy();
       entity.destroy();
       resource.destroy?.();
     });
@@ -233,18 +269,23 @@ class PlayCanvasBackend {
       return;
     }
     this.settingsSnapshot = snapshot;
+    if (this.rebuilding) return;
     const visibleItems = snapshot.items.filter((item) => item.visible && item.opacity.length);
     const resourcesById = new Map(this.resources.map((entry) => [entry.id, entry]));
     const topologyMatches = visibleItems.length === this.resources.length
       && visibleItems.every((item) => resourcesById.get(item.id)?.resource?.numSplats === item.opacity.length);
-    if (!topologyMatches && this.hasSnapshot) {
+    if (!topologyMatches && this.hasSnapshot && this.app.graphicsDevice.isWebGPU) {
+      this.rebuildWebGpuSnapshot();
+      return;
+    }
+    if (!topologyMatches && this.hasSnapshot && !this.app.graphicsDevice.isWebGPU) {
       // Unified GSplat keeps a packed world buffer whose placement topology is
       // not reliably replaced after its permanent RAF has been cancelled.
       // Topology edits are infrequent, so rebuild only this backend; appearance
       // edits with stable ids/counts continue through the fast texture path.
       const stage = this.canvas?.parentElement;
       this.dispose();
-      this.ensure(stage);
+      this.createApplication(stage);
       this.canvas.classList.add("is-active-backend");
       this.syncSnapshot(snapshot);
       return;
@@ -258,10 +299,12 @@ class PlayCanvasBackend {
         entry.resource.updateTransformData(data);
         setEntityTransform(entry.entity, item.worldMatrix);
         entry.entity.gsplat.workBufferUpdate = PlayCanvas.WORKBUFFER_UPDATE_ONCE;
+        this.installAppearance(entry, item);
         resourcesById.delete(item.id);
         return entry;
       }
       if (entry) {
+        entry.appearance?.params.destroy(); entry.appearance?.receivers.destroy();
         entry.entity.destroy();
         entry.resource.destroy?.();
         resourcesById.delete(item.id);
@@ -275,19 +318,102 @@ class PlayCanvasBackend {
         castShadows: false,
       });
       placementsChanged = true;
-      return { entity, id: item.id, resource };
+      entry = { entity, id: item.id, resource };
+      this.installAppearance(entry, item);
+      return entry;
     });
-    resourcesById.forEach(({ entity, resource }) => {
+    resourcesById.forEach(({ entity, resource, appearance }) => {
+      appearance?.params.destroy(); appearance?.receivers.destroy();
       entity.destroy();
       resource.destroy?.();
       placementsChanged = true;
     });
     this.resources = nextResources;
+    this.gpuAppearanceActive = this.resources.length > 0 && this.resources.every(entry => entry.appearance);
+    this.canvas.dataset.appearance = this.gpuAppearanceActive ? "gpu" : "cpu-compatibility";
     // The viewer cancels PlayCanvas' permanent RAF and renders on demand.
     // Reconcile newly added unified-GSplat placements once before the next
     // manual frame; app.render() alone does not run component systems.
     this.needsSystemUpdate ||= placementsChanged;
     this.hasSnapshot = true;
+  }
+
+  rebuildWebGpuSnapshot() {
+    if (this.rebuilding) return;
+    const lifecycle = this.lifecycle, stage = this.canvas.parentElement;
+    // Keep the old canvas until an independent replacement is ready. A fresh
+    // unified work buffer is required for topology edits in the host-driven loop.
+    const replacement = new PlayCanvasBackend({ onFrameRequest: this.onFrameRequest, onError: this.onError });
+    replacement.settings = this.settings;
+    const pending = (async () => {
+      try {
+        await replacement.ensure(stage);
+        if (this.lifecycle !== lifecycle) { replacement.dispose(); return; }
+        replacement.syncSnapshot(this.settingsSnapshot);
+        const active = this.canvas.classList.contains('is-active-backend');
+        this.dispose();
+        Object.assign(this, replacement);
+        this.lifecycle = lifecycle + 1;
+        this.canvas.classList.toggle('is-active-backend', active);
+        this.onFrameRequest?.();
+      } catch (error) {
+        replacement.dispose();
+        console.error('PlayCanvas topology rebuild:', error);
+        this.onError?.(`PlayCanvas topology rebuild failed: ${error.message}`);
+        if (this.canvas) this.canvas.dataset.backendError = error.message;
+      } finally { if (this.rebuilding === pending) this.rebuilding = null; }
+    })();
+    this.rebuilding = pending;
+  }
+
+  makeAppearanceTexture(source, width) {
+    const height = Math.max(1, Math.ceil(source.length / (width * 4)));
+    if (height > this.app.graphicsDevice.maxTextureSize) throw new Error('GPU appearance texture exceeds device capacity');
+    const texture = new PlayCanvas.Texture(this.app.graphicsDevice, {
+      width, height, format: PlayCanvas.PIXELFORMAT_RGBA32F, mipmaps: false,
+      minFilter: PlayCanvas.FILTER_NEAREST, magFilter: PlayCanvas.FILTER_NEAREST,
+      addressU: PlayCanvas.ADDRESS_CLAMP_TO_EDGE, addressV: PlayCanvas.ADDRESS_CLAMP_TO_EDGE,
+    });
+    texture.lock().set(source); texture.unlock();
+    return texture;
+  }
+
+  installAppearance(entry, item) {
+    entry.appearance?.params.destroy(); entry.appearance?.receivers.destroy();
+    entry.appearance = null;
+    if (!item.appearance) { entry.entity.gsplat.setWorkBufferModifier(null); return; }
+    const data = packAppearanceReceivers(item, item.appearance);
+    const params = this.makeAppearanceTexture(packAppearance(item.appearance), APPEARANCE_WIDTH);
+    const receivers = this.makeAppearanceTexture(data, Math.min(1024, this.app.graphicsDevice.maxTextureSize));
+    entry.appearance = { params, receivers, data, state: appearanceIdentity(item.appearance), count: item.opacity.length };
+    this.appearanceCameraKey = null;
+    entry.entity.gsplat.setWorkBufferModifier(PC_APPEARANCE_MODIFIER);
+    entry.entity.gsplat.setParameter('appearanceParams', params);
+    entry.entity.gsplat.setParameter('appearanceReceivers', receivers);
+    entry.entity.gsplat.setParameter('appearanceCamera', [0,0,0]);
+  }
+
+  setAppearance(states) {
+    const byId = new Map(states.map(state => [state.id, state]));
+    if (this.rebuilding || !this.gpuAppearanceActive || this.resources.length !== states.length
+      || this.resources.some(entry => !appearanceSupported(byId.get(entry.id)))) return false;
+    for (const entry of this.resources) {
+      const state = byId.get(entry.id), a = entry.appearance;
+      a.params.lock().set(packAppearance(state)); a.params.unlock();
+      // Updating texture contents alone does not dirty unified-GSplat's cached
+      // work buffer. The public parameter setter invalidates the placement.
+      entry.entity.gsplat.setParameter('appearanceParams', a.params);
+      if (a.state.visibility?.data !== state.visibility?.data
+        || a.state.lights.map(l=>l.id).join() !== state.lights.map(l=>l.id).join()) {
+        updateAppearanceVisibility(a.data, state, a.count);
+        a.receivers.lock().set(a.data); a.receivers.unlock();
+      }
+      // Copy identity fields: the viewer's mutable cache handles may be cleared.
+      a.state = { ...state, visibility: state.visibility ? { data: state.visibility.data, lightIds: [...state.visibility.lightIds] } : null };
+      entry.entity.gsplat.workBufferUpdate = PlayCanvas.WORKBUFFER_UPDATE_ONCE;
+    }
+    this.onFrameRequest?.();
+    return true;
   }
 
   syncItemTransforms(items) {
@@ -309,6 +435,14 @@ class PlayCanvasBackend {
     this.canvas.style.height = "100%";
     this.app.graphicsDevice.resizeCanvas(renderWidth, renderHeight);
     this.cameraEntity.setLocalPosition(camera.position.x, camera.position.y, camera.position.z);
+    const cameraKey = `${camera.position.x},${camera.position.y},${camera.position.z}`;
+    if (cameraKey !== this.appearanceCameraKey) {
+      this.appearanceCameraKey = cameraKey;
+      for (const entry of this.resources) if (entry.appearance) {
+        entry.entity.gsplat.setParameter('appearanceCamera', [camera.position.x,camera.position.y,camera.position.z]);
+        entry.entity.gsplat.workBufferUpdate = PlayCanvas.WORKBUFFER_UPDATE_ONCE;
+      }
+    }
     this.cameraEntity.setLocalRotation(camera.quaternion.x, camera.quaternion.y, camera.quaternion.z, camera.quaternion.w);
     this.cameraEntity.camera.fov = camera.fov;
     this.cameraEntity.camera.aspectRatio = width / Math.max(height, 1);
@@ -360,6 +494,9 @@ class PlayCanvasBackend {
   }
 
   dispose() {
+    this.lifecycle++;
+    this.initializing = null;
+    this.rebuilding = null;
     this.clear();
     this.frameRequestEvent?.off?.();
     this.frameRequestEvent = null;
@@ -376,81 +513,8 @@ class PlayCanvasBackend {
   }
 }
 
-const gaussianVertexShader = /* glsl */`
-precision highp float;
-attribute vec2 corner;
-attribute vec3 splatCenter;
-attribute vec3 splatCovarianceDiagonal;
-attribute vec3 splatCovarianceOffDiagonal;
-attribute vec3 splatColor;
-attribute float splatOpacity;
-uniform vec2 renderSize;
-uniform float gaussianCutoff;
-uniform float preBlurVariance;
-varying vec2 vGaussianUv;
-varying vec3 vColor;
-varying float vOpacity;
-
-void main() {
-  vec4 viewCenter4 = viewMatrix * vec4(splatCenter, 1.0);
-  vec3 viewCenter = viewCenter4.xyz;
-  float viewDepth = -viewCenter.z;
-  if (viewDepth <= 0.00001) {
-    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-    return;
-  }
-  vec4 clipCenter = projectionMatrix * viewCenter4;
-  mat3 viewRotation = mat3(viewMatrix);
-  mat3 covarianceWorld = mat3(
-    splatCovarianceDiagonal.x, splatCovarianceOffDiagonal.x, splatCovarianceOffDiagonal.y,
-    splatCovarianceOffDiagonal.x, splatCovarianceDiagonal.y, splatCovarianceOffDiagonal.z,
-    splatCovarianceOffDiagonal.y, splatCovarianceOffDiagonal.z, splatCovarianceDiagonal.z
-  );
-  mat3 covariance3d = viewRotation * covarianceWorld * transpose(viewRotation);
-  vec2 focal = 0.5 * renderSize * vec2(projectionMatrix[0][0], projectionMatrix[1][1]);
-  vec3 jacobianX = vec3(focal.x / viewDepth, 0.0, focal.x * viewCenter.x / (viewDepth * viewDepth));
-  vec3 jacobianY = vec3(0.0, focal.y / viewDepth, focal.y * viewCenter.y / (viewDepth * viewDepth));
-  float covarianceXX = max(dot(jacobianX, covariance3d * jacobianX) + preBlurVariance, 0.0001);
-  float covarianceXY = dot(jacobianX, covariance3d * jacobianY);
-  float covarianceYY = max(dot(jacobianY, covariance3d * jacobianY) + preBlurVariance, 0.0001);
-  float mean = 0.5 * (covarianceXX + covarianceYY);
-  float spread = sqrt(max(0.0, mean * mean - (covarianceXX * covarianceYY - covarianceXY * covarianceXY)));
-  float eigenMajor = max(mean + spread, 0.0001);
-  float eigenMinor = max(mean - spread, 0.0001);
-  vec2 axisMajor = abs(covarianceXY) > 0.00001
-    ? normalize(vec2(covarianceXY, eigenMajor - covarianceXX))
-    : (covarianceXX >= covarianceYY ? vec2(1.0, 0.0) : vec2(0.0, 1.0));
-  vec2 axisMinor = vec2(-axisMajor.y, axisMajor.x);
-  vec2 pixelOffset = gaussianCutoff * (corner.x * axisMajor * sqrt(eigenMajor) + corner.y * axisMinor * sqrt(eigenMinor));
-  vec2 ndcOffset = (2.0 * pixelOffset) / renderSize;
-  vec3 ndcCenter = clipCenter.xyz / clipCenter.w;
-  gl_Position = vec4((ndcCenter.xy + ndcOffset) * clipCenter.w, clipCenter.zw);
-  vGaussianUv = corner * gaussianCutoff;
-  vColor = splatColor;
-  vOpacity = splatOpacity;
-}
-`;
-
-const gaussianFragmentShader = /* glsl */`
-precision highp float;
-uniform float gaussianCutoff;
-uniform float alphaCutoff;
-varying vec2 vGaussianUv;
-varying vec3 vColor;
-varying float vOpacity;
-void main() {
-  float radiusSquared = dot(vGaussianUv, vGaussianUv);
-  if (radiusSquared > gaussianCutoff * gaussianCutoff) discard;
-  float alpha = clamp(vOpacity * exp(-0.5 * radiusSquared), 0.0, 1.0);
-  if (alpha < alphaCutoff) discard;
-  gl_FragColor = vec4(vColor, alpha);
-  #include <tonemapping_fragment>
-  #include <colorspace_fragment>
-  #include <premultiplied_alpha_fragment>
-}
-`;
-
 class ThreeR186Backend {
+  get supportsGpuAppearance() { return Boolean(this.renderer?.backend?.isWebGPUBackend); }
   constructor() {
     this.settings = createRendererSettings("three-r186");
     this.canvas = null;
@@ -462,11 +526,10 @@ class ThreeR186Backend {
     this.mesh = null;
     this.snapshot = null;
     this.flat = null;
-    this.sorted = null;
-    this.sortedAttributes = null;
-    this.order = new Uint32Array(0);
-    this.lastSortView = new Float64Array(16);
-    this.sortInvalidated = true;
+    this.lifecycle = 0;
+    this.initializing = null;
+    this.appearancePass = null;
+    this.appearanceDirty = true;
     this.lastWidth = 0;
     this.lastHeight = 0;
     this.lastPixelRatio = 0;
@@ -477,50 +540,44 @@ class ThreeR186Backend {
     this.boundsHelper = null;
   }
 
-  ensure(stage) {
+  async ensure(stage) {
     if (ThreeR186.REVISION !== EXPECTED_THREE_REVISION) {
       throw new Error(`ThreeR186Backend requires ${EXPECTED_THREE_REVISION}; received ${ThreeR186.REVISION}`);
     }
-    if (this.renderer) {
-      return;
-    }
-    this.canvas = document.createElement("canvas");
-    this.canvas.className = "lookdev-backend-canvas";
-    this.canvas.dataset.backendCanvas = "three-r186";
-    stage.append(this.canvas);
-    this.renderer = new ThreeR186.WebGLRenderer({ canvas: this.canvas, alpha: false, antialias: false, powerPreference: "high-performance" });
-    this.renderer.outputColorSpace = ThreeR186.SRGBColorSpace;
-    this.renderer.toneMapping = ThreeR186.NoToneMapping;
-    this.renderer.setPixelRatio(1);
-    this.scene = new ThreeR186.Scene();
-    this.camera = new ThreeR186.PerspectiveCamera(60, 1, 0.0005, 5000);
-    this.geometry = new ThreeR186.InstancedBufferGeometry();
-    this.geometry.setAttribute("corner", new ThreeR186.Float32BufferAttribute([-1, -1, 1, -1, -1, 1, 1, 1], 2));
-    this.geometry.setIndex([0, 1, 2, 2, 1, 3]);
-    this.material = new ThreeR186.ShaderMaterial({
-      transparent: true,
-      premultipliedAlpha: true,
-      depthTest: true,
-      depthWrite: false,
-      blending: ThreeR186.CustomBlending,
-      blendSrc: ThreeR186.OneFactor,
-      blendDst: ThreeR186.OneMinusSrcAlphaFactor,
-      uniforms: {
-        renderSize: { value: new ThreeR186.Vector2(1, 1) },
-        gaussianCutoff: { value: this.settings.gaussianCutoff },
-        alphaCutoff: { value: this.settings.alphaCutoff },
-        preBlurVariance: { value: this.settings.preBlurVariance },
-      },
-      vertexShader: gaussianVertexShader,
-      fragmentShader: gaussianFragmentShader,
-    });
-    this.mesh = new ThreeR186.Mesh(this.geometry, this.material);
-    this.mesh.frustumCulled = false;
-    this.scene.add(this.mesh);
+    if (this.initializing) return this.initializing;
+    if (this.renderer) return true;
+    const lifecycle = ++this.lifecycle;
+    const canvas = document.createElement("canvas");
+    canvas.className = "lookdev-backend-canvas";
+    canvas.dataset.backendCanvas = "three-r186";
+    const renderer = new ThreeR186.WebGPURenderer({ canvas, alpha: false, antialias: false });
+    const pending = (async () => {
+      try { await renderer.init(); }
+      catch(error) { await renderer.dispose(); throw error; }
+      if (lifecycle !== this.lifecycle) { await renderer.dispose(); return false; }
+      this.renderer = renderer;
+      this.canvas = canvas;
+      canvas.dataset.graphicsApi = renderer.backend.isWebGPUBackend ? 'webgpu' : 'webgl2';
+      stage.append(canvas);
+      renderer.outputColorSpace = ThreeR186.SRGBColorSpace;
+      renderer.toneMapping = ThreeR186.NoToneMapping;
+      renderer.setPixelRatio(1);
+      this.scene = new ThreeR186.Scene();
+      this.camera = new ThreeR186.PerspectiveCamera(60, 1, 0.0005, 5000);
+      this.createHelpers();
+      return true;
+    })();
+    this.initializing = pending;
+    try { return await pending; }
+    finally { if(this.initializing === pending) this.initializing = null; }
+  }
+
+  createHelpers() {
     this.axesHelper = new ThreeR186.AxesHelper(1);
     this.axesHelper.visible = false;
     this.scene.add(this.axesHelper);
     this.gridHelper = new ThreeR186.GridHelper(1, 10, 0x5ce2c3, 0x20384d);
+    this.gridDivisions = 10;
     this.gridHelper.visible = false;
     this.scene.add(this.gridHelper);
     this.boundsBox = new ThreeR186.Box3();
@@ -535,92 +592,117 @@ class ThreeR186Backend {
   }
 
   syncSnapshot(snapshot) {
-    if (!this.geometry) {
+    if (!this.renderer) return;
+    this.releaseSplats();
+    this.snapshot = snapshot;
+    // One world-space mesh gives intersecting items a single official GPU sort.
+    this.flat = flattenVisibleSnapshot(snapshot, { includeQuaternion: false, includeCovariance: true });
+    if (!this.flat.count) {
+      this.gpuAppearanceActive = false;
+      this.canvas.dataset.appearance = 'cpu-compatibility';
       return;
     }
-    this.snapshot = snapshot;
-    this.flat = flattenVisibleSnapshot(snapshot, { includeQuaternion: false, includeCovariance: true });
-    if (!this.sorted || this.sorted.opacity.length !== this.flat.count) {
-      this.geometry.dispose();
-      this.sorted = {
-        center: new Float32Array(this.flat.count * 3),
-        covarianceDiagonal: new Float32Array(this.flat.count * 3),
-        covarianceOffDiagonal: new Float32Array(this.flat.count * 3),
-        linearRgb: new Float32Array(this.flat.count * 3),
-        opacity: new Float32Array(this.flat.count),
-      };
-      this.sortedAttributes = {
-        center: new ThreeR186.InstancedBufferAttribute(this.sorted.center, 3).setUsage(ThreeR186.DynamicDrawUsage),
-        covarianceDiagonal: new ThreeR186.InstancedBufferAttribute(this.sorted.covarianceDiagonal, 3).setUsage(ThreeR186.DynamicDrawUsage),
-        covarianceOffDiagonal: new ThreeR186.InstancedBufferAttribute(this.sorted.covarianceOffDiagonal, 3).setUsage(ThreeR186.DynamicDrawUsage),
-        linearRgb: new ThreeR186.InstancedBufferAttribute(this.sorted.linearRgb, 3).setUsage(ThreeR186.DynamicDrawUsage),
-        opacity: new ThreeR186.InstancedBufferAttribute(this.sorted.opacity, 1).setUsage(ThreeR186.DynamicDrawUsage),
-      };
-      this.geometry.setAttribute("splatCenter", this.sortedAttributes.center);
-      this.geometry.setAttribute("splatCovarianceDiagonal", this.sortedAttributes.covarianceDiagonal);
-      this.geometry.setAttribute("splatCovarianceOffDiagonal", this.sortedAttributes.covarianceOffDiagonal);
-      this.geometry.setAttribute("splatColor", this.sortedAttributes.linearRgb);
-      this.geometry.setAttribute("splatOpacity", this.sortedAttributes.opacity);
+    const covariance = new Float32Array(this.flat.count * 6);
+    const color = new Uint8Array(this.flat.count * 4);
+    for(let i=0;i<this.flat.count;i++) {
+      const j=i*3,d=this.flat.covarianceDiagonal,o=this.flat.covarianceOffDiagonal;
+      covariance.set([d[j],o[j],o[j+1],d[j+1],o[j+2],d[j+2]],i*6);
+      for(let c=0;c<3;c++) color[i*4+c]=Math.round(Math.min(1,Math.max(0,linearToSrgbChannel(this.flat.linearRgb[j+c])))*255);
+      color[i*4+3]=Math.round(Math.min(1,Math.max(0,this.flat.opacity[i]))*255);
     }
-    if (this.order.length !== this.flat.count) {
-      this.order = new Uint32Array(this.flat.count);
-      for (let index = 0; index < this.order.length; index += 1) this.order[index] = index;
+    const geometry = new ThreeR186.BufferGeometry();
+    geometry.setAttribute('position',new ThreeR186.BufferAttribute(this.flat.center.slice(),3));
+    geometry.setAttribute('covariance',new ThreeR186.BufferAttribute(covariance,6));
+    geometry.setAttribute('color',new ThreeR186.BufferAttribute(color,4,true));
+    this.mesh = new ThreeR186.GaussianSplat(geometry, { autoSort: false });
+    this.mesh.frustumCulled = false;
+    this.material = this.mesh.material;
+    this.scene.add(this.mesh);
+    this.installAppearance(snapshot);
+    this.applySettings();
+  }
+
+  releaseSplats() {
+    this.appearancePass?.compute.dispose();
+    this.appearancePass = null;
+    if(this.mesh) {
+      this.scene?.remove(this.mesh);
+      ThreeR186.disposeNativeSplat(this.mesh);
     }
-    this.sortInvalidated = true;
-    this.geometry.instanceCount = this.flat.count;
-    // Refresh GPU attributes immediately in the last camera order. The next
-    // frame may re-sort for a changed camera, but appearance-only snapshots
-    // must not wait for a later camera movement before becoming visible.
-    this.sortByCamera(this.camera);
+    this.appearanceParams?.dispose(); this.appearanceReceivers?.dispose();
+    this.appearanceParams = this.appearanceReceivers = null;
+    this.appearanceSlots = null;
+    this.appearanceEntries = [];
+    this.gpuAppearanceActive = false;
+    this.appearanceDirty = true;
+    this.mesh = this.material = null;
+  }
+
+  makeAppearanceTexture(source, width) {
+    const height = Math.max(1, Math.ceil(source.length / (width * 4)));
+    const maxSize = this.renderer.backend.device?.limits.maxTextureDimension2D ?? 8192;
+    if (width > maxSize || height > maxSize) throw new Error('GPU appearance texture exceeds device capacity');
+    const data = new Float32Array(width * height * 4); data.set(source);
+    const texture = new ThreeR186.DataTexture(data, width, height, ThreeR186.RGBAFormat, ThreeR186.FloatType);
+    texture.colorSpace = ThreeR186.NoColorSpace; texture.needsUpdate = true;
+    return texture;
+  }
+
+  installAppearance(snapshot) {
+    this.appearanceParams?.dispose(); this.appearanceReceivers?.dispose();
+    const items = snapshot.items.filter(item => item.visible && item.opacity.length);
+    this.gpuAppearanceActive = this.supportsGpuAppearance && items.length > 0 && items.every(item => item.appearance);
+    this.canvas.dataset.appearance = this.gpuAppearanceActive ? 'gpu' : 'cpu-compatibility';
+    this.appearanceSlots = new Float32Array(this.flat.count * 2);
+    if (!this.gpuAppearanceActive) return;
+    const params = new Float32Array(Math.max(1, items.length) * APPEARANCE_WIDTH * 4);
+    const data = new Float32Array(Math.max(1, this.flat.count) * 16);
+    let offset = 0;
+    this.appearanceEntries = items.map((item, row) => {
+      params.set(packAppearance(item.appearance), row * APPEARANCE_WIDTH * 4);
+      data.set(packAppearanceReceivers(item, item.appearance), offset * 16);
+      const entry = { id: item.id, row, offset, count: item.opacity.length, state: appearanceIdentity(item.appearance) };
+      offset += item.opacity.length;
+      return entry;
+    });
+    const byId = new Map(this.appearanceEntries.map(entry => [entry.id, entry]));
+    for (let i = 0; i < this.flat.count; i++) {
+      const entry = byId.get(this.flat.itemIds[this.flat.itemIndex[i]]);
+      this.appearanceSlots.set([entry.offset + this.flat.sourceIndex[i], entry.row], i * 2);
+    }
+    this.appearanceParams = this.makeAppearanceTexture(params, APPEARANCE_WIDTH);
+    this.appearanceReceivers = this.makeAppearanceTexture(data, 1024);
+    this.appearancePass = ThreeR186.createNativeAppearance(this.mesh, this.flat, this.appearanceSlots, this.appearanceParams, this.appearanceReceivers);
+    this.appearanceDirty = true;
+  }
+
+  setAppearance(states) {
+    const byId = new Map(states.map(state => [state.id, state]));
+    if (!this.gpuAppearanceActive || this.appearanceEntries.length !== states.length
+      || this.appearanceEntries.some(entry => !appearanceSupported(byId.get(entry.id)))) return false;
+    for (const entry of this.appearanceEntries) {
+      const state = byId.get(entry.id);
+      this.appearanceParams.image.data.set(packAppearance(state), entry.row * APPEARANCE_WIDTH * 4);
+      if (entry.state.visibility?.data !== state.visibility?.data
+        || entry.state.lights.map(l=>l.id).join() !== state.lights.map(l=>l.id).join()) {
+        updateAppearanceVisibility(this.appearanceReceivers.image.data, state, entry.count, entry.offset);
+        this.appearanceReceivers.needsUpdate = true;
+      }
+      entry.state = { ...state, visibility: state.visibility ? { data: state.visibility.data, lightIds: [...state.visibility.lightIds] } : null };
+    }
+    this.appearanceParams.needsUpdate = true;
+    this.appearanceDirty = true;
+    return true;
   }
 
   syncItemTransforms(items) {
     const nextFlat = updateFlattenedSnapshotItemTransforms(this.snapshot, this.flat, items);
-    if (nextFlat !== this.flat) {
+    if (nextFlat !== this.flat && this.mesh) {
       this.flat = nextFlat;
-      this.sortInvalidated = true;
+      ThreeR186.updateNativeGeometry(this.mesh, this.flat);
+      this.appearancePass?.updatePositions(this.flat);
+      this.appearanceDirty = true;
     }
-  }
-
-  sortByCamera(sourceCamera) {
-    if (!this.flat || !this.sorted) {
-      return;
-    }
-    sourceCamera.updateMatrixWorld?.(true);
-    const view = sourceCamera.matrixWorldInverse.elements;
-    if (!this.sortInvalidated && view.every((value, index) => value === this.lastSortView[index])) return;
-    this.lastSortView.set(view);
-    this.order.sort((left, right) => {
-      const leftOffset = left * 3;
-      const rightOffset = right * 3;
-      const leftDepth = (view[2] * this.flat.center[leftOffset]) + (view[6] * this.flat.center[leftOffset + 1]) + (view[10] * this.flat.center[leftOffset + 2]) + view[14];
-      const rightDepth = (view[2] * this.flat.center[rightOffset]) + (view[6] * this.flat.center[rightOffset + 1]) + (view[10] * this.flat.center[rightOffset + 2]) + view[14];
-      return leftDepth - rightDepth || left - right;
-    });
-    for (let output = 0; output < this.order.length; output += 1) {
-      const source = this.order[output];
-      const source3 = source * 3;
-      const output3 = output * 3;
-      this.sorted.center[output3] = this.flat.center[source3];
-      this.sorted.center[output3 + 1] = this.flat.center[source3 + 1];
-      this.sorted.center[output3 + 2] = this.flat.center[source3 + 2];
-      this.sorted.covarianceDiagonal[output3] = this.flat.covarianceDiagonal[source3];
-      this.sorted.covarianceDiagonal[output3 + 1] = this.flat.covarianceDiagonal[source3 + 1];
-      this.sorted.covarianceDiagonal[output3 + 2] = this.flat.covarianceDiagonal[source3 + 2];
-      this.sorted.covarianceOffDiagonal[output3] = this.flat.covarianceOffDiagonal[source3];
-      this.sorted.covarianceOffDiagonal[output3 + 1] = this.flat.covarianceOffDiagonal[source3 + 1];
-      this.sorted.covarianceOffDiagonal[output3 + 2] = this.flat.covarianceOffDiagonal[source3 + 2];
-      this.sorted.linearRgb[output3] = this.flat.linearRgb[source3];
-      this.sorted.linearRgb[output3 + 1] = this.flat.linearRgb[source3 + 1];
-      this.sorted.linearRgb[output3 + 2] = this.flat.linearRgb[source3 + 2];
-      this.sorted.opacity[output] = this.flat.opacity[source];
-    }
-    this.sortedAttributes.center.needsUpdate = true;
-    this.sortedAttributes.covarianceDiagonal.needsUpdate = true;
-    this.sortedAttributes.covarianceOffDiagonal.needsUpdate = true;
-    this.sortedAttributes.linearRgb.needsUpdate = true;
-    this.sortedAttributes.opacity.needsUpdate = true;
-    this.sortInvalidated = false;
   }
 
   syncFrame({ camera, background, helpers, width, height, pixelRatio }) {
@@ -647,7 +729,6 @@ class ThreeR186Backend {
     this.camera.quaternion.copy(camera.quaternion);
     this.camera.updateProjectionMatrix();
     this.camera.updateMatrixWorld(true);
-    this.material.uniforms.renderSize.value.set(width * pixelRatio, height * pixelRatio);
     const axesLength = Math.max(Number(helpers?.axesLength) || 0.5, 0.5);
     this.axesHelper.visible = Boolean(helpers?.showAxes);
     this.axesHelper.scale.setScalar(axesLength);
@@ -669,31 +750,33 @@ class ThreeR186Backend {
       this.boundsBox.min.set(...helpers.bounds.min);
       this.boundsBox.max.set(...helpers.bounds.max);
     }
-    this.sortByCamera(camera);
+    if(this.appearancePass && (this.appearanceDirty || !this.appearancePass.camera.value.equals(this.camera.position))) {
+      this.appearancePass.camera.value.copy(this.camera.position);
+      this.renderer.compute(this.appearancePass.compute);
+      this.appearanceDirty = false;
+    }
+    this.mesh?.updateSort(this.renderer, this.camera);
     this.renderer.render(this.scene, this.camera);
   }
 
   get telemetry() {
-    return `THREE.REVISION ${ThreeR186.REVISION} · WebGLRenderer · covariance ellipses`;
+    return `THREE.REVISION ${ThreeR186.REVISION} · GaussianSplat · ${this.canvas?.dataset.graphicsApi ?? 'initializing'}`;
   }
 
   dispose() {
-    this.geometry?.dispose();
-    this.material?.dispose();
-    this.renderer?.dispose();
+    this.lifecycle += 1;
+    this.releaseSplats();
+    for(const helper of [this.axesHelper,this.gridHelper,this.boundsHelper]) {
+      helper?.geometry.dispose();
+      if(Array.isArray(helper?.material)) helper.material.forEach(m=>m.dispose());
+      else helper?.material.dispose();
+    }
+    this.renderer?.dispose().catch(error => console.warn('Three.js disposal:', error));
     this.canvas?.remove();
-    this.renderer = null;
-    this.canvas = null;
-    this.scene = null;
-    this.camera = null;
-    this.geometry = null;
-    this.material = null;
-    this.mesh = null;
-    this.snapshot = null;
-    this.flat = null;
-    this.sorted = null;
-    this.sortedAttributes = null;
-    this.order = new Uint32Array(0);
+    this.renderer = this.canvas = this.scene = this.camera = null;
+    this.axesHelper = this.gridHelper = this.boundsHelper = null;
+    this.snapshot = this.flat = null;
+    this.lastWidth = this.lastHeight = this.lastPixelRatio = 0;
   }
 }
 
@@ -708,7 +791,7 @@ export class LookDevBackendManager {
     this.activationToken = 0;
     this.snapshot = Object.freeze({ version: 1, items: Object.freeze([]), splatCount: 0 });
     this.backends = new Map([
-      ["playcanvas", new PlayCanvasBackend({ onFrameRequest })],
+      ["playcanvas", new PlayCanvasBackend({ onFrameRequest, onError: onStatus })],
       ["three-r186", new ThreeR186Backend()],
     ]);
     this.updateCanvasVisibility();
@@ -747,6 +830,7 @@ export class LookDevBackendManager {
       throw new Error(`Unsupported renderer backend: ${id}`);
     }
     const activationToken = ++this.activationToken;
+    this.pendingActivationId = id;
     if (id !== "spark") {
       await this.loadVendor(id);
     }
@@ -757,10 +841,14 @@ export class LookDevBackendManager {
     if (id !== "spark") {
       const backend = this.backends.get(id);
       try {
-        // Capture after the async vendor load: edits, file loads and visibility
-        // changes during that wait must be present in the first new frame.
-        nextSnapshot = getSnapshot ? getSnapshot() : this.snapshot;
-        backend.ensure(this.stage);
+        await backend.ensure(this.stage);
+        if (activationToken !== this.activationToken) {
+          if (this.pendingActivationId !== id && this.activeId !== id) backend.dispose();
+          return false;
+        }
+        // Capture after vendor and GPU-device initialization so edits during
+        // either async wait are included in the replacement's first frame.
+        nextSnapshot = getSnapshot ? getSnapshot({ gpuAppearance: backend.supportsGpuAppearance }) : this.snapshot;
         backend.syncSnapshot(nextSnapshot);
       } catch (error) {
         backend.dispose();
@@ -803,7 +891,5 @@ export class LookDevBackendManager {
 export {
   BACKEND_VENDOR_DEFINITIONS,
   EXPECTED_THREE_REVISION,
-  gaussianFragmentShader,
-  gaussianVertexShader,
   loadBackendVendor,
 };

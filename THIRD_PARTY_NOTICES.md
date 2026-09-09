@@ -15,15 +15,15 @@ Keep these notices with redistributed copies, including static-site releases.
   - `vendor/three/examples/jsm/controls/TransformControls.js`
   - `vendor/three/examples/jsm/postprocessing/Pass.js` (r180)
   - `viewer.bundle.js` (Three.js r180)
-  - `viewer-vendor-three-r186.bundle.js` (Three.js `186dev`, upstream commit
-    `283a3b359d70bf6dc7b54bc129698fbb32be49a9`)
+  - `viewer-vendor-three-r186.bundle.js` (official Three.js r186 / npm 0.186.0,
+    with a guarded circular-splat projection fix in `tools/build-three-r186.mjs`)
 - Upstream:
   - https://github.com/mrdoob/three.js
 - License:
   - MIT
 
 Copyright 2010-2025 Three.js Authors (r180).
-Copyright © 2010-2026 three.js authors (r186dev).
+Copyright © 2010-2026 three.js authors (r186).
 The MIT license text below applies to both copies.
 
 ### Spark 2.1.0

@@ -100,12 +100,13 @@ test('persistent LUT and brush writes invalidate bake state and refresh alternat
 });
 
 test('alternate snapshots share exposure, lighting, and tone-curve appearance updates', () => {
-  assert.match(source, /captureRendererSnapshot\(\)[\s\S]*?createSceneSnapshot\(this\.sceneItems, \{[\s\S]*?mapLinearRgb:[\s\S]*?getDisplayLinearColorForSample/);
+  assert.match(source, /captureRendererSnapshot\(\{ gpuAppearance[\s\S]*?createSceneSnapshot\(this\.sceneItems, \{[\s\S]*?mapLinearRgb:[\s\S]*?if \(!useGpu\) return this\.getDisplayLinearColorForSample/);
+  assert.match(source, /appearanceOnly && syncActive && this\.backendManager\.activeBackend\?\.setAppearance/);
   assert.doesNotMatch(source, /getDisplayLinearColorForSample\(item, sample\)[\s\S]*?activeId !== "spark"[\s\S]*?sample\.baseLinearRgb\.slice\(\)/);
   assert.match(source, /applyExposure\([\s\S]*?requestActiveBackendAppearanceRefresh\("Scene exposure updated"/);
   assert.match(source, /applySelectedExposure\([\s\S]*?requestActiveBackendAppearanceRefresh\("Selected exposure updated"/);
   assert.match(source, /applyToneCurve\([\s\S]*?requestActiveBackendAppearanceRefresh\("Tone curve updated"/);
-  assert.match(source, /refreshLightingModel\([\s\S]*?refreshActiveBackendSnapshot\("Lighting updated"\)/);
+  assert.match(source, /refreshLightingModel\([\s\S]*?refreshActiveBackendSnapshot\("Lighting updated", \{ appearanceOnly: !geometryChanged \|\| !occlusionChanged \}\)/);
   assert.match(source, /hasCameraDependentAlternateAppearance\(\)[\s\S]*?!this\.staticBakeApplied[\s\S]*?!item\.hasAuthoredSplatNormals/);
   assert.match(source, /scheduleCameraDependentAppearanceRefresh\(\)[\s\S]*?window\.setTimeout\([\s\S]*?refreshActiveBackendSnapshot\("Camera-dependent lighting updated"\)/);
   assert.match(source, /orbitControls\.addEventListener\("change", \(\) => \{[\s\S]*?scheduleCameraDependentAppearanceRefresh\(\)/);

@@ -13,9 +13,9 @@ for quick experiments without downloading a dataset.
 
 ## Features
 
-- Spark, PlayCanvas, and Three.js rendering backends.
+- Spark, PlayCanvas, and official Three.js r186 GaussianSplat rendering backends.
 - Scene transforms, alignment, brush editing, and splat export.
-- Linear-sRGB color grading, point lights, cached occlusion, and static baking.
+- Linear-sRGB grading, point/area/directional lights, cached occlusion, and point-light baking.
 - Camera controls and a collapsible animation timeline.
 
 Spark provides the full editing and look-development toolset. PlayCanvas and
@@ -35,7 +35,7 @@ validation. On Windows, `npm run open` also launches the local HTML directly.
 
 ## Rendering notes
 
-Occlusion considers all visible splats within documented limits and caches
+WebGPU-first occlusion considers all visible splats within documented limits and caches
 visibility for static scenes. It is not per-frame ray tracing or full global
 illumination. Imported splat colors are captured radiance, not diffuse albedo.
 

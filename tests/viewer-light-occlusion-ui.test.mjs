@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { getLightOcclusionTextureLayout } from "../viewer-light-occlusion.mjs";
+import { createLightOcclusionWorkerSnapshot } from "../viewer-static-lighting-client.mjs";
+import { expandLightSamples, lightVector } from '../viewer-light-types.mjs';
 
 const source = readFileSync(new URL("../viewer.js", import.meta.url), "utf8");
 const markup = readFileSync(new URL("../index.html", import.meta.url), "utf8");
@@ -22,6 +24,7 @@ const makeViewer = () => {
   }));
   return {
     sceneItems: items, sceneLights: [{ id: "left", visible: true }, { id: "right", visible: true }],
+    getLightSamples() { return expandLightSamples(this.sceneLights); },
     renderer: { capabilities: { maxTextureSize: 1024 } },
     getSceneItemById(id) { return items.find((item) => item.id === id); },
     getPackedSplatCount(item) { return item.count; },
@@ -65,7 +68,7 @@ test("invalidation releases textures immediately and debounces replacement work"
     lightOcclusionRevision: 0, lightOcclusionTimer: 0, state: { lightOcclusionEnabled: true },
     lightOcclusionController: { cancel() { canceled += 1; } }, lightOcclusionEmptyTexture: {},
     getLightOcclusionAvailability() { return { enabled: true }; }, syncLightOcclusionUi() {},
-    renderPickedColors() {},
+    renderPickedColors() {}, refreshActiveBackendSnapshot() {},
     releaseLightOcclusion(item) { release.call(this, item); }, forceVisualRefresh() { refreshed += 1; }, queueSparkSceneUpdate() {},
   });
   applyResult.call(viewer, snapshot, result, result.lightIds);
@@ -81,14 +84,19 @@ test("invalidation releases textures immediately and debounces replacement work"
   assert.equal(canceled, 2);
   assert.equal(clears, 2);
   assert.equal(viewer.lightOcclusionRevision, 2);
+  const immutableSnapshot = {};
+  viewer.lightOcclusionSnapshot = immutableSnapshot;
+  invalidate.call(viewer, "Light moved", { geometryChanged: false });
+  assert.equal(viewer.lightOcclusionSnapshot, immutableSnapshot);
   viewer.state.lightOcclusionEnabled = false;
   invalidate.call(viewer, "Off");
-  assert.equal(scheduled, 2);
+  assert.equal(viewer.lightOcclusionSnapshot, null);
+  assert.equal(scheduled, 3);
 });
 
 test("a late worker completion cannot apply visibility from an old scene revision", async () => {
   let finish, applied = 0;
-  const start = method("startLightOcclusion", { performance: { now: () => 0 }, THREE: { Vector3: class {} } });
+  const start = method("startLightOcclusion", { lightVector, createLightOcclusionWorkerSnapshot, performance: { now: () => 0 }, THREE: { Vector3: class {} } });
   const viewer = {
     lightOcclusionRevision: 1, state: { lightOcclusionEnabled: true }, transformControls: {}, sceneItems: [],
     getLightOcclusionAvailability: () => ({ enabled: true, splatCount: 1, lights: [{ id: "left", root: { updateWorldMatrix() {}, getWorldPosition: () => ({ toArray: () => [0, 0, 0] }) } }] }),

@@ -8,6 +8,8 @@
  * never treated as albedo or given an inferred surface normal.
  */
 
+import { directionalRayOrigin } from './viewer-light-types.mjs';
+
 export const STATIC_BAKE_VERSION = 1;
 export const STATIC_BAKE_SUPPORT_SIGMA = 3;
 export const STATIC_BAKE_LEAF_SIZE = 16;
@@ -1078,11 +1080,12 @@ const segmentIntersectsPackedBounds = (lightX, lightY, lightZ, receiverX, receiv
   return true;
 };
 
-export function evaluateBvhTransmission({ bvh, lightPosition, receiverIndex, snapshot, sourceIndex } = {}) {
+export function evaluateBvhTransmission({ bvh, lightPosition, receiverIndex, snapshot, sourceIndex, lightDirection } = {}) {
   const receiverOffset = receiverIndex * 3;
   if (!bvh || bvh.root < 0 || receiverOffset < 0 || receiverOffset + 2 >= snapshot?.center?.length) {
     return { opticalDepth: 0, testedCandidates: 0, transmission: 1 };
   }
+  if (lightDirection) lightPosition = directionalRayOrigin(bvh, receiverIndex, lightDirection);
   const lightX = finite(lightPosition?.[0]);
   const lightY = finite(lightPosition?.[1]);
   const lightZ = finite(lightPosition?.[2]);
@@ -1136,9 +1139,9 @@ export function evaluateBvhTransmission({ bvh, lightPosition, receiverIndex, sna
           const receiverEndpointBias = occluderItem === receiverItem ? Math.max(receiverSigma, occluderSigma) : 0;
           const sourceEndpointT = hasSourceEndpoint
             ? Math.min(Math.max(sourceEndpointBias / segmentLength, STATIC_BAKE_SEGMENT_ENDPOINT_EPSILON), 0.49)
-            : STATIC_BAKE_SEGMENT_ENDPOINT_EPSILON;
+            : (lightDirection ? 0 : STATIC_BAKE_SEGMENT_ENDPOINT_EPSILON);
           const receiverEndpointT = Math.min(
-            Math.max(receiverEndpointBias / segmentLength, STATIC_BAKE_SEGMENT_ENDPOINT_EPSILON),
+            Math.max(receiverEndpointBias / segmentLength, lightDirection ? 0 : STATIC_BAKE_SEGMENT_ENDPOINT_EPSILON),
             0.49,
           );
           if (t > sourceEndpointT && t < (1 - receiverEndpointT)) {
@@ -1630,6 +1633,7 @@ export async function bakeAllSplatsDirectLightAsync({
   onProgress,
   shouldCancel,
   snapshot,
+  precomputedVisibility = null,
   yieldToEventLoop = () => new Promise((resolve) => setTimeout(resolve, 0)),
 } = {}) {
   const count = validateStaticBakeSnapshot(snapshot);
@@ -1646,7 +1650,15 @@ export async function bakeAllSplatsDirectLightAsync({
   const lightColor = at3(light?.color, 0);
   const intensity = Math.max(finite(light?.intensity), 0);
   const safeChunkSize = Math.max(1, Math.floor(finite(chunkSize, 128)));
-  const bvh = await createDeterministicSplatBvhAsync(snapshot, {
+  if (precomputedVisibility && (precomputedVisibility.snapshot !== snapshot
+    || precomputedVisibility.bvh?.count !== count
+    || precomputedVisibility.transmission?.length !== count
+    || precomputedVisibility.opticalDepth?.length !== count
+    || precomputedVisibility.transmission.some((value) => !Number.isFinite(value) || value < 0 || value > 1)
+    || precomputedVisibility.opticalDepth.some((value) => !Number.isFinite(value) || value < 0))) {
+    throw new Error("Precomputed visibility does not match the immutable bake snapshot");
+  }
+  const bvh = precomputedVisibility?.bvh ?? await createDeterministicSplatBvhAsync(snapshot, {
     chunkSize: Math.max(1, Math.floor(finite(indexingChunkSize, 4096))),
     onProgress,
     shouldCancel,
@@ -1666,7 +1678,9 @@ export async function bakeAllSplatsDirectLightAsync({
     const end = Math.min(start + safeChunkSize, count);
     for (let index = start; index < end; index += 1) {
       if (shouldCancel?.()) return { canceled: true, phase: "baking", processed: index, total: count };
-      const visibility = evaluateBvhTransmission({ bvh, lightPosition, receiverIndex: index, snapshot });
+      const visibility = precomputedVisibility
+        ? { transmission: precomputedVisibility.transmission[index], opticalDepth: precomputedVisibility.opticalDepth[index], testedCandidates: 0 }
+        : evaluateBvhTransmission({ bvh, lightPosition, receiverIndex: index, snapshot });
       transmission[index] = visibility.transmission;
       opticalDepth[index] = visibility.opticalDepth;
       testedCandidates += visibility.testedCandidates;

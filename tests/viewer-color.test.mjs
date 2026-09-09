@@ -7,6 +7,7 @@ import * as color from '../viewer-color.mjs';
 import * as tone from '../viewer-tone-curve.mjs';
 import * as lighting from '../viewer-lighting.mjs';
 import * as lut from '../viewer-lut.mjs';
+import { expandLightSamples } from '../viewer-light-types.mjs';
 import { createSceneSnapshot, SH_C0 } from '../renderer-contract.mjs';
 import { GSplatData } from '../node_modules/playcanvas/build/playcanvas/src/scene/gsplat/gsplat-data.js';
 
@@ -51,6 +52,7 @@ function fixture(space = color.SPLAT_COLOR_SPACE.LINEAR) {
     settings: { opacity: 1, exposure: 0, shLevel: 0, toneCurve: tone.buildToneCurveState() } };
   const downloads = [], statuses = [];
   const viewer = { sceneItems: [item], sceneLights: [], state: { oneBouncePreview: false }, spark: { falloff: 1 },
+    getLightSamples() { return expandLightSamples(this.sceneLights); },
     backendManager: { activeId: 'spark' }, camera: { getWorldPosition: () => new THREE.Vector3(0, 0, 4) },
     getPackedSplatCount: () => splats.length, getPackedSplatAt: (_, i) => splats[i],
     getSplatQuaternion: method('getSplatQuaternion'), getSplatNormal: method('getSplatNormal'),
@@ -182,6 +184,26 @@ test('export bakes exposure, colored lighting, cached and legacy occlusion, and 
       near(color.colorComponents(exported[0].color), expected);
       near(decodedRgb(await decode(serializer(exported)), 0), expected);
     }
+  }
+});
+
+test('area and directional exports encode graded sample contributions as sRGB', async () => {
+  const {viewer,item,splats}=fixture('srgb');
+  viewer.sceneLights=[
+    {id:'sun',type:'directional',visible:true,position:[99,20,30],direction:[0,0,-1],intensity:0.5,color:[0,0.5,1]},
+    {id:'panel',type:'area',visible:true,position:[0,0,3],direction:[0,0,-1],right:[1,0,0],up:[0,1,0],width:2,height:1,intensity:2,color:[1,0.2,0.1]},
+  ];
+  item.settings.toneCurve.curves.master=[{x:0,y:0},{x:1,y:0.6}];
+  viewer.getCachedLightTransmission=(_item,_sample,id)=>id==='panel/sample-0'?0:0.7;
+  viewer.evaluateLightTransmission=()=>1;
+  const sample=splats[0], samples=expandLightSamples(viewer.sceneLights).map(light=>({...light,visibility:viewer.getCachedLightTransmission(null,null,light.id)}));
+  const lit=lighting.applyDirectLighting({baseLinearRgb:color.sourceColorToLinear(sample.color,'srgb'),position:sample.center,normal:[0,0,1],lights:samples});
+  const expected=color.linearColorToSrgb(tone.applyToneCurveToLinearRgb(lit,item.settings.toneCurve));
+  for(const activeId of ['spark','playcanvas','three-r186']) {
+    viewer.backendManager.activeId=activeId;
+    const exported=viewer.buildExportSplatsForItem(item);
+    near(color.colorComponents(exported[0].color),expected);
+    near(decodedRgb(await decode(serializer(exported)),0),expected);
   }
 });
 
